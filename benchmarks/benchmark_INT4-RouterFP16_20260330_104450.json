@@ -1,0 +1,152 @@
+[
+  {
+    "test": "niah",
+    "context_length": 4096,
+    "depth": 0.25,
+    "passkey": "914615",
+    "answer": "914615",
+    "correct": true,
+    "elapsed": 1.52,
+    "output_tokens": 1
+  },
+  {
+    "test": "niah",
+    "context_length": 4096,
+    "depth": 0.5,
+    "passkey": "812703",
+    "answer": "812703",
+    "correct": true,
+    "elapsed": 1.14,
+    "output_tokens": 1
+  },
+  {
+    "test": "niah",
+    "context_length": 4096,
+    "depth": 0.75,
+    "passkey": "274274",
+    "answer": "274274",
+    "correct": true,
+    "elapsed": 1.02,
+    "output_tokens": 1
+  },
+  {
+    "test": "niah",
+    "context_length": 8192,
+    "depth": 0.25,
+    "passkey": "247878",
+    "answer": "247878",
+    "correct": true,
+    "elapsed": 2.52,
+    "output_tokens": 1
+  },
+  {
+    "test": "niah",
+    "context_length": 8192,
+    "depth": 0.5,
+    "passkey": "080351",
+    "answer": "080351",
+    "correct": true,
+    "elapsed": 2.51,
+    "output_tokens": 1
+  },
+  {
+    "test": "niah",
+    "context_length": 8192,
+    "depth": 0.75,
+    "passkey": "865827",
+    "answer": "865827",
+    "correct": true,
+    "elapsed": 2.03,
+    "output_tokens": 1
+  },
+  {
+    "test": "niah",
+    "context_length": 16384,
+    "depth": 0.25,
+    "passkey": "777094",
+    "answer": "777094",
+    "correct": true,
+    "elapsed": 7.81,
+    "output_tokens": 1
+  },
+  {
+    "test": "niah",
+    "context_length": 16384,
+    "depth": 0.5,
+    "passkey": "842366",
+    "answer": "842366",
+    "correct": true,
+    "elapsed": 8.59,
+    "output_tokens": 1
+  },
+  {
+    "test": "niah",
+    "context_length": 16384,
+    "depth": 0.75,
+    "passkey": "914176",
+    "answer": "914176",
+    "correct": true,
+    "elapsed": 6.86,
+    "output_tokens": 1
+  },
+  {
+    "test": "niah",
+    "context_length": 24576,
+    "depth": 0.25,
+    "passkey": "222911",
+    "answer": "222911",
+    "correct": true,
+    "elapsed": 20.48,
+    "output_tokens": 1
+  },
+  {
+    "test": "niah",
+    "context_length": 24576,
+    "depth": 0.5,
+    "passkey": "307146",
+    "answer": "307146",
+    "correct": true,
+    "elapsed": 20.26,
+    "output_tokens": 1
+  },
+  {
+    "test": "niah",
+    "context_length": 24576,
+    "depth": 0.75,
+    "passkey": "722667",
+    "answer": "722667",
+    "correct": true,
+    "elapsed": 14.82,
+    "output_tokens": 1
+  },
+  {
+    "test": "niah",
+    "context_length": 32768,
+    "depth": 0.25,
+    "passkey": "628321",
+    "answer": "628321",
+    "correct": true,
+    "elapsed": 34.34,
+    "output_tokens": 1
+  },
+  {
+    "test": "niah",
+    "context_length": 32768,
+    "depth": 0.5,
+    "passkey": "466005",
+    "answer": "466005",
+    "correct": true,
+    "elapsed": 34.15,
+    "output_tokens": 1
+  },
+  {
+    "test": "niah",
+    "context_length": 32768,
+    "depth": 0.75,
+    "passkey": "190356",
+    "answer": "190356",
+    "correct": true,
+    "elapsed": 25.72,
+    "output_tokens": 1
+  }
+]

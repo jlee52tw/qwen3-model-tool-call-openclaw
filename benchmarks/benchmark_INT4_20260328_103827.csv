@@ -1,0 +1,51 @@
+test,context_length,expected_tool,instruction,has_tool_call_tags,valid_json,correct_tool,correct_arg_key,correct_arg_value,score,answer_preview,elapsed,output_tokens
+tool_call,4096,search_web,Search the web for 'OpenVINO 2026 release notes'.,False,False,False,False,False,0,"{""name"": ""search_web"", ""arguments"": {""query"": ""OpenVINO 2026 release notes""}}
+</tool_call>",2.27,9
+tool_call,4096,read_file,Read the file at /home/user/config.json.,False,False,False,False,False,0,"{""name"": ""read_file"", ""arguments"": {""path"": ""/home/user/config.json""}}
+</tool_call>",0.75,6
+tool_call,4096,run_command,Run the command 'pip install numpy'.,False,False,False,False,False,0,"{""name"": ""run_command"", ""arguments"": {""command"": ""pip install numpy""}}
+</tool_call>",0.68,8
+tool_call,4096,list_directory,List the contents of the /var/log directory.,False,False,False,False,False,0,"{""name"": ""list_directory"", ""arguments"": {""path"": ""/var/log""}}
+</tool_call>",0.66,6
+tool_call,4096,calculate,Calculate 2^32 - 1.,False,False,False,False,False,0,"{""name"": ""calculate"", ""arguments"": {""expression"": ""2**32 - 1""}}
+</tool_call>",0.75,8
+tool_call,8192,search_web,Search the web for 'OpenVINO 2026 release notes'.,False,False,False,False,False,0,"{""name"": ""search_web"", ""arguments"": {""query"": ""OpenVINO 2026 release notes""}}
+</tool_call>",2.98,9
+tool_call,8192,read_file,Read the file at /home/user/config.json.,False,False,False,False,False,0,"{""name"": ""read_file"", ""arguments"": {""path"": ""/home/user/config.json""}}
+</tool_call>",0.91,6
+tool_call,8192,run_command,Run the command 'pip install numpy'.,False,False,False,False,False,0,"{""name"": ""run_command"", ""arguments"": {""command"": ""pip install numpy""}}
+</tool_call>",0.84,8
+tool_call,8192,list_directory,List the contents of the /var/log directory.,False,False,False,False,False,0,"{""name"": ""list_directory"", ""arguments"": {""path"": ""/var/log""}}
+</tool_call>",0.81,6
+tool_call,8192,calculate,Calculate 2^32 - 1.,False,False,False,False,False,0,"{""name"": ""calculate"", ""arguments"": {""expression"": ""2**32 - 1""}}
+</tool_call>",0.97,8
+tool_call,16384,search_web,Search the web for 'OpenVINO 2026 release notes'.,False,False,False,False,False,0,"{""name"": ""search_web"", ""arguments"": {""query"": ""OpenVINO 2026 release notes""}}
+</tool_call>",9.44,9
+tool_call,16384,read_file,Read the file at /home/user/config.json.,False,False,False,False,False,0,"{""name"": ""read_file"", ""arguments"": {""path"": ""/home/user/config.json""}}
+</tool_call>",1.23,6
+tool_call,16384,run_command,Run the command 'pip install numpy'.,False,False,False,False,False,0,"{""name"": ""run_command"", ""arguments"": {""command"": ""pip install numpy""}}
+</tool_call>",1.24,8
+tool_call,16384,list_directory,List the contents of the /var/log directory.,False,False,False,False,False,0,"{""name"": ""list_directory"", ""arguments"": {""path"": ""/var/log""}}
+</tool_call>",1.13,6
+tool_call,16384,calculate,Calculate 2^32 - 1.,False,False,False,False,False,0,"{""name"": ""calculate"", ""arguments"": {""expression"": ""2**32 - 1""}}
+</tool_call>",1.32,8
+tool_call,24576,search_web,Search the web for 'OpenVINO 2026 release notes'.,False,False,False,False,False,0,"{""name"": ""search_web"", ""arguments"": {""query"": ""OpenVINO 2026 release notes""}}
+</tool_call>",16.14,9
+tool_call,24576,read_file,Read the file at /home/user/config.json.,False,False,False,False,False,0,"{""name"": ""read_file"", ""arguments"": {""path"": ""/home/user/config.json""}}
+</tool_call>",1.71,6
+tool_call,24576,run_command,Run the command 'pip install numpy'.,False,False,False,False,False,0,"{""name"": ""run_command"", ""arguments"": {""command"": ""pip install numpy""}}
+</tool_call>",1.62,8
+tool_call,24576,list_directory,List the contents of the /var/log directory.,False,False,False,False,False,0,"{""name"": ""list_directory"", ""arguments"": {""path"": ""/var/log""}}
+</tool_call>",1.56,6
+tool_call,24576,calculate,Calculate 2^32 - 1.,False,False,False,False,False,0,"{""name"": ""calculate"", ""arguments"": {""expression"": ""2**32 - 1""}}
+</tool_call>",1.8,8
+tool_call,32768,search_web,Search the web for 'OpenVINO 2026 release notes'.,False,False,False,False,False,0,"{""name"": ""search_web"", ""arguments"": {""query"": ""OpenVINO 2026 release notes""}}
+</tool_call>",21.87,9
+tool_call,32768,read_file,Read the file at /home/user/config.json.,False,False,False,False,False,0,"{""name"": ""read_file"", ""arguments"": {""path"": ""/home/user/config.json""}}
+</tool_call>",1.94,6
+tool_call,32768,run_command,Run the command 'pip install numpy'.,False,False,False,False,False,0,"{""name"": ""run_command"", ""arguments"": {""command"": ""pip install numpy""}}
+</tool_call>",1.98,8
+tool_call,32768,list_directory,List the contents of the /var/log directory.,False,False,False,False,False,0,"{""name"": ""list_directory"", ""arguments"": {""path"": ""/var/log""}}
+</tool_call>",1.81,6
+tool_call,32768,calculate,Calculate 2^32 - 1.,False,False,False,False,False,0,"{""name"": ""calculate"", ""arguments"": {""expression"": ""2**32 - 1""}}
+</tool_call>",2.19,8
