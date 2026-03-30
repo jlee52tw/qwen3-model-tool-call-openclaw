@@ -433,27 +433,25 @@ When you need to use a tool, respond with:
 
 def _prepare_long_tool_calling_dataset(tokenizer, num_samples=32):
     """
-    Create mixed-length long-context (24K-64K token) agentic calibration samples.
+    Create OpenClaw v2026 tool-calling calibration samples for AWQ/scale_estimation.
 
-    This is critical for AWQ to properly protect attention weights at long contexts.
-    Each sample simulates a real OpenClaw v2026 agentic session with:
-    - OpenClaw system prompt with 22+ tool definitions (read, write, edit, exec, etc.)
+    Each sample simulates a real OpenClaw agentic session with:
+    - OpenClaw system prompt with 20 tool definitions (read, write, edit, exec, etc.)
     - Multi-turn conversation history with tool calls and results
     - Final user instruction requiring precise tool use
 
-    Samples are distributed across 4 target lengths to cover the full
-    agentic coding assistant working range:
-      - 24K tokens: 5-7 turn coding session (most common degradation point)
-      - 32K tokens: 7-10 turn session (critical for tool-call accuracy)
-      - 48K tokens: 10-15 turn deep debug/refactor session
-      - 64K tokens: 15-20 turn complex multi-file session
+    Hardware constraint (32 GB RAM + 57 GB FP16 model):
+      MoE 128 experts → ~1 MB activation memory per token for FullyConnected nodes.
+      20K tokens → 20 GB allocation → OOM on 32 GB system.
+      Safe limit: 4096 tokens per sample.
 
-    Memory justification (Qwen3-30B-A3B on 27.5 GB iGPU):
-      KV cache = 96 KB/token (GQA 4 KV heads), so:
-      64K tokens = 6 GB KV + 15.3 GB weights = 21.3 GB → fits comfortably
-
-    The long-context activations help NNCF identify which weights are most sensitive
-    to quantization in the attention layers (q/k/v/o_proj) at extended contexts.
+    Why this still helps despite short sequences:
+      AWQ identifies important weight channels by measuring ACTIVATION MAGNITUDES.
+      The importance pattern is determined by CONTENT TYPE (tool calls, code context),
+      not primarily by sequence length. Tool-call calibration at 4K tokens is still
+      vastly superior to the baseline data-free quantization (no calibration at all).
+      Combined with group_size=64, AWQ, and scale_estimation, this should significantly
+      improve tool-calling accuracy compared to the baseline INT4 (gs=128, data-free).
     """
     import json
     import random
@@ -991,34 +989,36 @@ When you need to use a tool, respond with:
 
 Always use the most appropriate tool for the task. Do not explain what you're doing — just execute the tool call directly."""
 
-    print(f"  Generating {num_samples} mixed-length agentic calibration samples (24K-64K tokens)...")
+    # ── Hardware constraint ──────────────────────────────────────────────────
+    # FP16 model = 57 GB (memory-mapped). System RAM = 32 GB.
+    # NNCF statistics collection runs full forward pass on CPU.
+    # With MoE 128 experts, each token costs ~1 MB activation memory for the
+    # largest FullyConnected nodes. 20K tokens → 20 GB allocation → OOM.
+    #
+    # Safe limit: 4096 tokens (~4 GB activation) on 32 GB RAM.
+    # AWQ value comes from CONTENT PATTERN (tool-call vs generic text),
+    # not from sequence length. OpenClaw tool-call calibration at 4K tokens
+    # is still vastly better than baseline data-free quantization.
+    # ──────────────────────────────────────────────────────────────────────────
+    MAX_SEQ_LEN = 4096
+
+    print(f"  Generating {num_samples} OpenClaw tool-call calibration samples (max {MAX_SEQ_LEN} tokens)...")
     calibration_data = []
 
-    # Distribute samples across target lengths: 24K, 32K, 48K, 64K
-    TARGET_LENGTHS = [24576, 32768, 49152, 65536]
-    # Corresponding exchange counts to reach target length
-    # With OpenClaw's larger tool schemas + code padding, each exchange ≈ 400-800 tokens
-    # We need more exchanges and heavier padding to hit targets
-    EXCHANGE_RANGES = {
-        24576: (20, 30),    # 20-30 exchanges → need ~24K of context
-        32768: (28, 40),    # 28-40 exchanges → need ~32K of context
-        49152: (42, 60),    # 42-60 exchanges → need ~48K of context
-        65536: (58, 80),    # 58-80 exchanges → need ~64K of context
-    }
+    # Vary exchange counts for diversity (3-5 multi-turn exchanges per sample)
+    # Each exchange ≈ 600-900 tokens with code padding → 3-5 exchanges fills ~2K-4K
+    EXCHANGE_RANGE = (3, 5)
+
+    all_snippets = CODE_SNIPPETS + LONG_CODE_SNIPPETS
 
     for i in range(num_samples):
         random.seed(42 + i)  # Reproducible but varied
-        target_len = TARGET_LENGTHS[i % len(TARGET_LENGTHS)]
-        min_ex, max_ex = EXCHANGE_RANGES[target_len]
 
         messages = [{"role": "system", "content": system_prompt}]
 
         # Build multi-turn history with tool calls and results
-        num_exchanges = random.randint(min_ex, max_ex)
+        num_exchanges = random.randint(*EXCHANGE_RANGE)
         used_exchanges = random.choices(TOOL_CALL_EXCHANGES, k=num_exchanges)
-
-        # For longer samples, also use the longer code snippets
-        all_snippets = CODE_SNIPPETS + (LONG_CODE_SNIPPETS if target_len >= 32768 else [])
 
         for tc_args, result_text in used_exchanges:
             # User request that led to this tool call
@@ -1042,16 +1042,9 @@ Always use the most appropriate tool for the task. Do not explain what you're do
             tc_json = json.dumps(tc_args)
             messages.append({"role": "assistant", "content": f"<tool_call>\n{tc_json}\n</tool_call>"})
 
-            # Tool result (with heavier code snippet padding for realism)
-            # Use multiple snippets concatenated for longer samples to fill context
-            # All targets need at least 2 pads + extra block to reach target length
-            # Each exchange ≈ 1000-1200 tokens with this padding level
-            num_pads = 3 if target_len >= 49152 else 2
-            code_pads = random.choices(all_snippets, k=num_pads)
-            full_result = result_text + "\n\nRelated code context:\n```\n" + "\n\n".join(code_pads) + "\n```"
-            # Always append a secondary code block to ensure each exchange is long enough
-            extra = random.choice(all_snippets)
-            full_result += f"\n\nAlso found in a related module:\n```\n{extra}\n```"
+            # Tool result (with code snippet padding for realism)
+            code_pad = random.choice(all_snippets)
+            full_result = result_text + "\n\nRelated code context:\n```\n" + code_pad + "\n```"
             messages.append({"role": "user", "content": f"[Tool Result]\n{full_result}"})
 
             # Assistant analysis
@@ -1074,7 +1067,7 @@ Always use the most appropriate tool for the task. Do not explain what you're do
         # Add the expected correct response for the calibration
         text += f"<tool_call>\n{json.dumps(expected_tc)}\n</tool_call>"
 
-        inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=target_len)
+        inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=MAX_SEQ_LEN)
         token_len = inputs["input_ids"].shape[1]
 
         # Add position_ids and beam_idx required by text-generation-with-past OV model
@@ -1084,20 +1077,11 @@ Always use the most appropriate tool for the task. Do not explain what you're do
 
         calibration_data.append(dict(inputs))
 
-        if i < 4:  # Print first sample of each target length
-            print(f"    Sample {i} (target {target_len//1024}K): {token_len} tokens")
-
-    # Summary by target length
-    by_target = {}
-    for i, d in enumerate(calibration_data):
-        t = TARGET_LENGTHS[i % len(TARGET_LENGTHS)]
-        by_target.setdefault(t, []).append(d["input_ids"].shape[1])
-    for t in sorted(by_target):
-        lens = by_target[t]
-        print(f"    {t//1024}K target: {len(lens)} samples, avg {sum(lens)/len(lens):.0f} tokens")
+        if i < 8:  # Print first few samples
+            print(f"    Sample {i}: {token_len} tokens ({num_exchanges} exchanges)")
 
     avg_len = sum(d["input_ids"].shape[1] for d in calibration_data) / len(calibration_data)
-    print(f"  Collected {len(calibration_data)} mixed-length samples (overall avg {avg_len:.0f} tokens)")
+    print(f"  Collected {len(calibration_data)} samples (avg {avg_len:.0f} tokens, max {MAX_SEQ_LEN})")
     return calibration_data
 
 
