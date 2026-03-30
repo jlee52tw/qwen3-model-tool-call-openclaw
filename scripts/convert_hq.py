@@ -358,6 +358,10 @@ def _prepare_calibration_dataset(tokenizer, dataset_name="wikitext2", num_sample
             continue
 
         inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=2048)
+        token_len = inputs["input_ids"].shape[1]
+        import torch
+        inputs["position_ids"] = torch.arange(token_len).unsqueeze(0)
+        inputs["beam_idx"] = torch.zeros(1, dtype=torch.int32)
         calibration_data.append(dict(inputs))
 
         if len(calibration_data) >= num_samples:
@@ -412,6 +416,10 @@ When you need to use a tool, respond with:
             ]
             text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=4096)
+            token_len = inputs["input_ids"].shape[1]
+            import torch
+            inputs["position_ids"] = torch.arange(token_len).unsqueeze(0)
+            inputs["beam_idx"] = torch.zeros(1, dtype=torch.int32)
             calibration_data.append(dict(inputs))
 
             if len(calibration_data) >= num_samples:
@@ -989,12 +997,13 @@ Always use the most appropriate tool for the task. Do not explain what you're do
     # Distribute samples across target lengths: 24K, 32K, 48K, 64K
     TARGET_LENGTHS = [24576, 32768, 49152, 65536]
     # Corresponding exchange counts to reach target length
-    # Each exchange ≈ 1200-2000 tokens (user + tool_call + tool_result + analysis)
+    # With OpenClaw's larger tool schemas + code padding, each exchange ≈ 400-800 tokens
+    # We need more exchanges and heavier padding to hit targets
     EXCHANGE_RANGES = {
-        24576: (8, 14),    # 8-14 exchanges → ~16-22K of history
-        32768: (14, 20),   # 14-20 exchanges → ~22-32K of history
-        49152: (22, 32),   # 22-32 exchanges → ~34-50K of history
-        65536: (32, 42),   # 32-42 exchanges → ~50-66K of history
+        24576: (20, 30),    # 20-30 exchanges → need ~24K of context
+        32768: (28, 40),    # 28-40 exchanges → need ~32K of context
+        49152: (42, 60),    # 42-60 exchanges → need ~48K of context
+        65536: (58, 80),    # 58-80 exchanges → need ~64K of context
     }
 
     for i in range(num_samples):
@@ -1033,9 +1042,15 @@ Always use the most appropriate tool for the task. Do not explain what you're do
             tc_json = json.dumps(tc_args)
             messages.append({"role": "assistant", "content": f"<tool_call>\n{tc_json}\n</tool_call>"})
 
-            # Tool result (with code snippet padding for realism)
-            code_pad = random.choice(all_snippets)
-            full_result = result_text + "\n\nRelated code context:\n```\n" + code_pad + "\n```"
+            # Tool result (with heavier code snippet padding for realism)
+            # Use multiple snippets concatenated for longer samples to fill context
+            num_pads = 2 if target_len >= 49152 else 1
+            code_pads = random.choices(all_snippets, k=num_pads)
+            full_result = result_text + "\n\nRelated code context:\n```\n" + "\n\n".join(code_pads) + "\n```"
+            # For 48K+, also append a secondary code block to bulk up the result
+            if target_len >= 32768:
+                extra = random.choice(all_snippets)
+                full_result += f"\n\nAlso found in a related module:\n```\n{extra}\n```"
             messages.append({"role": "user", "content": f"[Tool Result]\n{full_result}"})
 
             # Assistant analysis
@@ -1060,6 +1075,12 @@ Always use the most appropriate tool for the task. Do not explain what you're do
 
         inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=target_len)
         token_len = inputs["input_ids"].shape[1]
+
+        # Add position_ids and beam_idx required by text-generation-with-past OV model
+        import torch
+        inputs["position_ids"] = torch.arange(token_len).unsqueeze(0)
+        inputs["beam_idx"] = torch.zeros(1, dtype=torch.int32)
+
         calibration_data.append(dict(inputs))
 
         if i < 4:  # Print first sample of each target length
