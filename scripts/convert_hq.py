@@ -521,19 +521,19 @@ def _prepare_long_tool_calling_dataset(tokenizer, num_samples=32):
         {"name": "sessions_spawn", "description": "Spawn a specialized sub-agent for a background task",
          "parameters": {"type": "object", "properties": {
              "task": {"type": "string", "description": "Task description for the sub-agent"},
-             "agent": {"type": "string", "description": "Agent role from IDENTITY.md"},
+             "agentId": {"type": "string", "description": "Agent role from IDENTITY.md"},
              "model": {"type": "string", "description": "Model to use for sub-agent"}
          }, "required": ["task"]}},
         {"name": "sessions_send", "description": "Send a message to another active session",
          "parameters": {"type": "object", "properties": {
-             "target_id": {"type": "string", "description": "Target session ID"},
+             "sessionKey": {"type": "string", "description": "Target session key"},
              "message": {"type": "string", "description": "Message content"}
-         }, "required": ["target_id", "message"]}},
+         }, "required": ["sessionKey", "message"]}},
         {"name": "sessions_yield", "description": "Pause and wait for a sub-agent to return a result",
          "parameters": {"type": "object", "properties": {
-             "target_id": {"type": "string", "description": "Session ID to wait for"},
+             "sessionKey": {"type": "string", "description": "Session key to wait for"},
              "timeout": {"type": "integer", "description": "Timeout in seconds"}
-         }, "required": ["target_id"]}},
+         }, "required": ["sessionKey"]}},
         # Memory & context
         {"name": "memory_search", "description": "Vector search over .openclaw/memory/ and Memory.md",
          "parameters": {"type": "object", "properties": {
@@ -910,7 +910,7 @@ spec:
             "Found 3 relevant entries:\n  [2026-03-15] Decided to use Alembic for migrations\n  [2026-03-20] PostgreSQL 16 as primary DB\n  [2026-03-22] Schema versioning follows semver"
         ),
         (
-            {"name": "sessions_spawn", "arguments": {"task": "Analyze the test coverage report and identify untested modules", "agent": "analyzer"}},
+            {"name": "sessions_spawn", "arguments": {"task": "Analyze the test coverage report and identify untested modules", "agentId": "analyzer"}},
             "Spawned sub-agent session: ses_abc123 (agent: analyzer)\nTask: Analyze the test coverage report and identify untested modules"
         ),
     ]
