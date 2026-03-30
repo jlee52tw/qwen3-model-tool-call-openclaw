@@ -428,8 +428,8 @@ def _prepare_long_tool_calling_dataset(tokenizer, num_samples=32):
     Create mixed-length long-context (24K-64K token) agentic calibration samples.
 
     This is critical for AWQ to properly protect attention weights at long contexts.
-    Each sample simulates a real agentic coding assistant conversation with:
-    - Complex system prompt with 12 tool definitions
+    Each sample simulates a real OpenClaw v2026 agentic session with:
+    - OpenClaw system prompt with 22+ tool definitions (read, write, edit, exec, etc.)
     - Multi-turn conversation history with tool calls and results
     - Final user instruction requiring precise tool use
 
@@ -450,70 +450,117 @@ def _prepare_long_tool_calling_dataset(tokenizer, num_samples=32):
     import json
     import random
 
+    # ── OpenClaw v2026.3.x Tool Definitions ──────────────────────────────────
+    # Matches the actual tool set from OpenClaw's Full Mode system prompt.
+    # Tool names are case-sensitive and must be called exactly as listed.
     TOOL_DEFINITIONS = [
-        {"name": "read_file", "description": "Read the contents of a file at the specified path",
+        # Core file operations
+        {"name": "read", "description": "Read raw text from a local file",
          "parameters": {"type": "object", "properties": {
-             "path": {"type": "string", "description": "Path to the file"},
-             "start_line": {"type": "integer", "description": "Starting line number (1-based)"},
-             "end_line": {"type": "integer", "description": "Ending line number (1-based, inclusive)"}
-         }, "required": ["path"]}},
-        {"name": "search_code", "description": "Search for code patterns using regex",
+             "file_path": {"type": "string", "description": "Path to the file to read"}
+         }, "required": ["file_path"]}},
+        {"name": "write", "description": "Overwrite or create a new file",
          "parameters": {"type": "object", "properties": {
-             "pattern": {"type": "string", "description": "Regex pattern to search for"},
-             "path": {"type": "string", "description": "Directory or file to search in"},
-             "include": {"type": "string", "description": "Glob pattern for files to include"}
-         }, "required": ["pattern"]}},
-        {"name": "replace_in_file", "description": "Replace text in a file",
-         "parameters": {"type": "object", "properties": {
-             "path": {"type": "string", "description": "Path to the file"},
-             "old_text": {"type": "string", "description": "Exact text to find"},
-             "new_text": {"type": "string", "description": "Replacement text"}
-         }, "required": ["path", "old_text", "new_text"]}},
-        {"name": "run_command", "description": "Execute a shell command",
-         "parameters": {"type": "object", "properties": {
-             "command": {"type": "string", "description": "Shell command to execute"},
-             "cwd": {"type": "string", "description": "Working directory"},
-             "timeout": {"type": "integer", "description": "Timeout in seconds"}
-         }, "required": ["command"]}},
-        {"name": "write_file", "description": "Write content to a file",
-         "parameters": {"type": "object", "properties": {
-             "path": {"type": "string", "description": "Path to the file"},
+             "file_path": {"type": "string", "description": "Path to the file"},
              "content": {"type": "string", "description": "Content to write"}
-         }, "required": ["path", "content"]}},
-        {"name": "list_directory", "description": "List contents of a directory",
+         }, "required": ["file_path", "content"]}},
+        {"name": "edit", "description": "Precise string-replacement within a file",
          "parameters": {"type": "object", "properties": {
-             "path": {"type": "string", "description": "Directory path"},
-             "recursive": {"type": "boolean", "description": "Whether to list recursively"}
+             "file_path": {"type": "string", "description": "Path to the file"},
+             "search_string": {"type": "string", "description": "Exact text to find"},
+             "replace_string": {"type": "string", "description": "Replacement text"}
+         }, "required": ["file_path", "search_string", "replace_string"]}},
+        {"name": "apply_patch", "description": "Apply a unified git diff/patch to the codebase",
+         "parameters": {"type": "object", "properties": {
+             "patch_content": {"type": "string", "description": "Unified diff content"}
+         }, "required": ["patch_content"]}},
+        # Search & navigation
+        {"name": "grep", "description": "Search file contents for specific patterns",
+         "parameters": {"type": "object", "properties": {
+             "pattern": {"type": "string", "description": "Regex or literal pattern"},
+             "path": {"type": "string", "description": "Directory or file to search"},
+             "include": {"type": "string", "description": "Glob pattern for files"}
+         }, "required": ["pattern"]}},
+        {"name": "find", "description": "Find files by glob pattern",
+         "parameters": {"type": "object", "properties": {
+             "pattern": {"type": "string", "description": "Glob pattern to match"},
+             "path": {"type": "string", "description": "Starting directory"}
+         }, "required": ["pattern"]}},
+        {"name": "ls", "description": "List directory contents",
+         "parameters": {"type": "object", "properties": {
+             "path": {"type": "string", "description": "Directory path"}
          }, "required": ["path"]}},
-        {"name": "get_diagnostics", "description": "Get compiler/linter errors for a file",
+        # Execution & process management
+        {"name": "exec", "description": "Run a shell command (pty available for TTY-required CLIs)",
          "parameters": {"type": "object", "properties": {
-             "path": {"type": "string", "description": "File path to check"}
-         }, "required": ["path"]}},
-        {"name": "apply_diff", "description": "Apply a unified diff to a file",
+             "command": {"type": "string", "description": "Shell command to execute"}
+         }, "required": ["command"]}},
+        {"name": "process", "description": "Manage long-running background terminal tasks",
          "parameters": {"type": "object", "properties": {
-             "path": {"type": "string", "description": "File to patch"},
-             "diff": {"type": "string", "description": "Unified diff content"}
-         }, "required": ["path", "diff"]}},
-        {"name": "create_file", "description": "Create a new file with content",
-         "parameters": {"type": "object", "properties": {
-             "path": {"type": "string", "description": "Path for the new file"},
-             "content": {"type": "string", "description": "File content"}
-         }, "required": ["path", "content"]}},
-        {"name": "delete_file", "description": "Delete a file or directory",
-         "parameters": {"type": "object", "properties": {
-             "path": {"type": "string", "description": "Path to delete"},
-             "recursive": {"type": "boolean", "description": "Delete recursively"}
-         }, "required": ["path"]}},
-        {"name": "web_search", "description": "Search the web for information",
-         "parameters": {"type": "object", "properties": {
-             "query": {"type": "string", "description": "Search query"},
-             "num_results": {"type": "integer", "description": "Number of results"}
-         }, "required": ["query"]}},
-        {"name": "manage_todos", "description": "Manage task tracking",
-         "parameters": {"type": "object", "properties": {
-             "action": {"type": "string", "enum": ["add", "complete", "list"]},
-             "title": {"type": "string"}, "id": {"type": "integer"}
+             "action": {"type": "string", "enum": ["list", "logs", "kill"],
+                        "description": "Action to perform"},
+             "pid": {"type": "integer", "description": "Process ID (for logs/kill)"}
          }, "required": ["action"]}},
+        # Web & browser
+        {"name": "web_search", "description": "Search the web via Brave/Google Search API",
+         "parameters": {"type": "object", "properties": {
+             "query": {"type": "string", "description": "Search query"}
+         }, "required": ["query"]}},
+        {"name": "web_fetch", "description": "Fetch and extract readable content from a URL",
+         "parameters": {"type": "object", "properties": {
+             "url": {"type": "string", "description": "URL to fetch"}
+         }, "required": ["url"]}},
+        {"name": "browser", "description": "Control a Chrome instance via CDP",
+         "parameters": {"type": "object", "properties": {
+             "action": {"type": "string", "enum": ["goto", "click", "type", "screenshot", "act"],
+                        "description": "Browser action"},
+             "target": {"type": "string", "description": "Element selector or URL"},
+             "value": {"type": "string", "description": "Value to type or act prompt"}
+         }, "required": ["action"]}},
+        # Multi-agent / sessions
+        {"name": "sessions_spawn", "description": "Spawn a specialized sub-agent for a background task",
+         "parameters": {"type": "object", "properties": {
+             "task": {"type": "string", "description": "Task description for the sub-agent"},
+             "agent": {"type": "string", "description": "Agent role from IDENTITY.md"},
+             "model": {"type": "string", "description": "Model to use for sub-agent"}
+         }, "required": ["task"]}},
+        {"name": "sessions_send", "description": "Send a message to another active session",
+         "parameters": {"type": "object", "properties": {
+             "target_id": {"type": "string", "description": "Target session ID"},
+             "message": {"type": "string", "description": "Message content"}
+         }, "required": ["target_id", "message"]}},
+        {"name": "sessions_yield", "description": "Pause and wait for a sub-agent to return a result",
+         "parameters": {"type": "object", "properties": {
+             "target_id": {"type": "string", "description": "Session ID to wait for"},
+             "timeout": {"type": "integer", "description": "Timeout in seconds"}
+         }, "required": ["target_id"]}},
+        # Memory & context
+        {"name": "memory_search", "description": "Vector search over .openclaw/memory/ and Memory.md",
+         "parameters": {"type": "object", "properties": {
+             "query": {"type": "string", "description": "Search query for memory"}
+         }, "required": ["query"]}},
+        {"name": "memory_get", "description": "Retrieve a specific key-value preference",
+         "parameters": {"type": "object", "properties": {
+             "key": {"type": "string", "description": "Key to retrieve (e.g. coding_style)"}
+         }, "required": ["key"]}},
+        # Vision & media
+        {"name": "image", "description": "Multi-modal analysis of a local image or screenshot",
+         "parameters": {"type": "object", "properties": {
+             "image_path": {"type": "string", "description": "Path to the image file"},
+             "prompt": {"type": "string", "description": "Analysis prompt"}
+         }, "required": ["image_path"]}},
+        {"name": "canvas", "description": "Visual diagramming tool",
+         "parameters": {"type": "object", "properties": {
+             "action": {"type": "string", "enum": ["generate", "list", "update"],
+                        "description": "Canvas action"},
+             "prompt": {"type": "string", "description": "Diagram description"}
+         }, "required": ["action", "prompt"]}},
+        # External messaging
+        {"name": "message", "description": "Send a message to an external channel (Slack, Discord, etc.)",
+         "parameters": {"type": "object", "properties": {
+             "channel": {"type": "string", "description": "Channel identifier"},
+             "content": {"type": "string", "description": "Message content"}
+         }, "required": ["channel", "content"]}},
     ]
 
     # Code snippets for realistic tool call/result padding
@@ -816,66 +863,118 @@ spec:
     ]
 
     # Tool call/result conversation fragments
+    # ── OpenClaw-style tool call / result exchanges for history padding ──────
     TOOL_CALL_EXCHANGES = [
         (
-            {"name": "read_file", "arguments": {"path": "src/main.py", "start_line": 1, "end_line": 50}},
+            {"name": "read", "arguments": {"file_path": "src/main.py"}},
             "File contents:\n```python\nimport sys\nfrom pathlib import Path\n\ndef main():\n    parser = argparse.ArgumentParser()\n    parser.add_argument('--config', type=str, required=True)\n    args = parser.parse_args()\n    config = load_config(args.config)\n    app = Application(config)\n    app.run()\n\nif __name__ == '__main__':\n    main()\n```"
         ),
         (
-            {"name": "search_code", "arguments": {"pattern": "def\\s+\\w+\\(.*\\)\\s*->", "path": "src/", "include": "*.py"}},
+            {"name": "grep", "arguments": {"pattern": "def\\s+\\w+\\(.*\\)\\s*->", "path": "src/", "include": "*.py"}},
             "Found 15 matches:\nsrc/main.py:4: def main() -> None:\nsrc/utils.py:12: def load_config(path: str) -> dict:\nsrc/utils.py:28: def validate_schema(data: dict) -> bool:\nsrc/db.py:8: def connect(url: str) -> Connection:\nsrc/db.py:45: def execute_query(conn: Connection, query: str) -> list:"
         ),
         (
-            {"name": "list_directory", "arguments": {"path": ".", "recursive": False}},
+            {"name": "ls", "arguments": {"path": "."}},
             "Contents:\n  src/\n  tests/\n  docs/\n  config.yaml\n  pyproject.toml\n  README.md\n  .gitignore\n  Makefile"
         ),
         (
-            {"name": "run_command", "arguments": {"command": "python -m pytest tests/ -v --tb=short", "cwd": ".", "timeout": 60}},
+            {"name": "exec", "arguments": {"command": "python -m pytest tests/ -v --tb=short"}},
             "===== test session starts =====\ncollected 24 items\ntests/test_main.py::test_init PASSED\ntests/test_main.py::test_config_loading PASSED\ntests/test_utils.py::test_validate_schema PASSED\ntests/test_utils.py::test_load_config FAILED\ntests/test_db.py::test_connection PASSED\n===== 1 failed, 23 passed in 2.34s ====="
         ),
         (
-            {"name": "get_diagnostics", "arguments": {"path": "src/utils.py"}},
-            "Diagnostics for src/utils.py:\n  Line 15: W0611 - Unused import 'os'\n  Line 32: E1101 - Instance of 'dict' has no 'validate' member\n  Line 48: C0301 - Line too long (127/120)"
+            {"name": "find", "arguments": {"pattern": "*.py", "path": "src/"}},
+            "Found 12 files:\n  src/main.py\n  src/utils.py\n  src/db.py\n  src/api.py\n  src/config.py\n  src/auth.py\n  src/models.py\n  src/routes.py\n  src/middleware.py\n  src/cache.py\n  src/tasks.py\n  src/schema.py"
         ),
         (
-            {"name": "replace_in_file", "arguments": {"path": "src/utils.py", "old_text": "import os\nimport sys", "new_text": "import sys"}},
+            {"name": "edit", "arguments": {"file_path": "src/utils.py", "search_string": "import os\nimport sys", "replace_string": "import sys"}},
             "Successfully replaced text in src/utils.py (1 occurrence)"
         ),
         (
-            {"name": "write_file", "arguments": {"path": "tests/test_new.py", "content": "import pytest\nfrom src.utils import validate_schema\n\ndef test_empty_schema():\n    assert validate_schema({}) is False\n"}},
+            {"name": "write", "arguments": {"file_path": "tests/test_new.py", "content": "import pytest\nfrom src.utils import validate_schema\n\ndef test_empty_schema():\n    assert validate_schema({}) is False\n"}},
             "File written successfully: tests/test_new.py (5 lines)"
         ),
         (
-            {"name": "web_search", "arguments": {"query": "python asyncio best practices 2026", "num_results": 5}},
+            {"name": "web_search", "arguments": {"query": "python asyncio best practices 2026"}},
             "Results:\n1. 'Modern Asyncio Patterns in Python 3.12+' - realpython.com\n2. 'Asyncio Task Groups and Exception Handling' - docs.python.org\n3. 'Performance Tips for Python Async IO' - stackoverflow.com"
+        ),
+        (
+            {"name": "web_fetch", "arguments": {"url": "https://docs.python.org/3/library/asyncio-task.html"}},
+            "Fetched content (4.2 KB):\n# Coroutines and Tasks\nThis section outlines high-level asyncio APIs to work with coroutines and Tasks.\n## Coroutines\nCoroutines declared with the async/await syntax..."
+        ),
+        (
+            {"name": "process", "arguments": {"action": "list"}},
+            "Active processes:\n  PID 12847: python -m http.server 8080 (running, 45m)\n  PID 13201: npm run dev (running, 12m)"
+        ),
+        (
+            {"name": "memory_search", "arguments": {"query": "database migration strategy"}},
+            "Found 3 relevant entries:\n  [2026-03-15] Decided to use Alembic for migrations\n  [2026-03-20] PostgreSQL 16 as primary DB\n  [2026-03-22] Schema versioning follows semver"
+        ),
+        (
+            {"name": "sessions_spawn", "arguments": {"task": "Analyze the test coverage report and identify untested modules", "agent": "analyzer"}},
+            "Spawned sub-agent session: ses_abc123 (agent: analyzer)\nTask: Analyze the test coverage report and identify untested modules"
         ),
     ]
 
-    # User requests that require specific tool calls as responses
+    # ── Final requests: the model MUST respond with the correct tool call ────
     FINAL_REQUESTS = [
-        ("Read the file src/config.py starting from line 45 to line 90.",
-         {"name": "read_file", "arguments": {"path": "src/config.py", "start_line": 45, "end_line": 90}}),
+        ("Read the file src/config.py so I can review the settings.",
+         {"name": "read", "arguments": {"file_path": "src/config.py"}}),
         ("Search for all TODO comments in the source code.",
-         {"name": "search_code", "arguments": {"pattern": "TODO|FIXME|HACK", "path": "src/", "include": "*.py"}}),
-        ("Replace the deprecated API call in src/api.py.",
-         {"name": "replace_in_file", "arguments": {"path": "src/api.py", "old_text": "requests.get(url)", "new_text": "httpx.get(url)"}}),
+         {"name": "grep", "arguments": {"pattern": "TODO|FIXME|HACK", "path": "src/", "include": "*.py"}}),
+        ("Replace the deprecated API call in src/api.py — change requests.get(url) to httpx.get(url).",
+         {"name": "edit", "arguments": {"file_path": "src/api.py", "search_string": "requests.get(url)", "replace_string": "httpx.get(url)"}}),
         ("Run the linter on the entire project.",
-         {"name": "run_command", "arguments": {"command": "python -m ruff check src/ --fix", "cwd": "."}}),
-        ("Check for any type errors in the database module.",
-         {"name": "get_diagnostics", "arguments": {"path": "src/db.py"}}),
+         {"name": "exec", "arguments": {"command": "python -m ruff check src/ --fix"}}),
+        ("Find all YAML config files in the project.",
+         {"name": "find", "arguments": {"pattern": "*.yaml", "path": "."}}),
         ("Create a new test file for the config module.",
-         {"name": "create_file", "arguments": {"path": "tests/test_config.py", "content": "import pytest\nfrom src.config import Config\n"}}),
+         {"name": "write", "arguments": {"file_path": "tests/test_config.py", "content": "import pytest\nfrom src.config import Config\n\ndef test_default_config():\n    cfg = Config()\n    assert cfg.debug is False\n"}}),
         ("List all files in the deployment directory.",
-         {"name": "list_directory", "arguments": {"path": "deploy/", "recursive": True}}),
-        ("Apply the diff to fix the import ordering issue.",
-         {"name": "apply_diff", "arguments": {"path": "src/main.py", "diff": "--- a/src/main.py\n+++ b/src/main.py\n@@ -1,3 +1,3 @@\n-import sys\n-import os\n+import os\n+import sys\n"}}),
+         {"name": "ls", "arguments": {"path": "deploy/"}}),
+        ("Apply this patch to fix the import ordering issue.",
+         {"name": "apply_patch", "arguments": {"patch_content": "--- a/src/main.py\n+++ b/src/main.py\n@@ -1,3 +1,3 @@\n-import sys\n-import os\n+import os\n+import sys\n"}}),
+        ("Search the web for the latest OpenVINO GenAI release notes.",
+         {"name": "web_search", "arguments": {"query": "OpenVINO GenAI 2026 release notes"}}),
+        ("Fetch the Python asyncio documentation page.",
+         {"name": "web_fetch", "arguments": {"url": "https://docs.python.org/3/library/asyncio.html"}}),
+        ("Check on the background dev server processes.",
+         {"name": "process", "arguments": {"action": "list"}}),
+        ("Spawn a sub-agent to refactor the database module while I continue working.",
+         {"name": "sessions_spawn", "arguments": {"task": "Refactor src/db.py to use async connection pooling with SQLAlchemy 2.0"}}),
     ]
 
-    system_prompt = f"""You are an expert coding assistant with access to the following tools:
+    # ── OpenClaw v2026 system prompt (simplified for calibration) ─────────────
+    system_prompt = f"""You are a personal assistant running inside OpenClaw. You are an autonomous entity with your own independent identity, specialized skill set, and isolated workspace. You do not just answer questions; you perform actions.
+
+## Runtime & Environment
+* Current Date & Time: 2026-03-30T10:00:00Z (Timezone: Asia/Taipei)
+* Operating System: Windows 11 (10.0.26100)
+* Working Directory: /workspace/project
+* Tool Policy: auto-approve-reads
+* Thinking Level: normal
+
+## Tool Availability & Definitions
+Tool names are **case-sensitive**. Call tools exactly as listed. You have access to the following:
 
 <tools>
 {json.dumps(TOOL_DEFINITIONS, indent=2)}
 </tools>
+
+## Tool Call Style & Logic
+* **Narration:** Do **not** narrate routine or low-risk tool calls. Just call the tool. Narrate only when explaining a complex multi-step plan, a high-risk deletion, or when explicitly asked.
+* **Efficiency:** If a task is complex or time-consuming, spawn a **sub-agent** using `sessions_spawn`.
+* **Verification:** Treat the working directory as the global root. Before modifying files, use `ls` or `find` to confirm their existence.
+
+## Memory & Context Protocol
+Before answering anything about prior work, user preferences, or past decisions:
+1. Run `memory_search` on MEMORY.md and memory/*.md.
+2. Use `memory_get` to retrieve only the specific relevant lines.
+3. If confidence is low after searching, state that you checked your memory.
+
+## Safety & Guardrails
+* Do not attempt to bypass tool-call approvals.
+* Do not access files outside the working directory unless the user provides an absolute path.
+* Avoid power-seeking behavior. You are an assistant, not the owner.
 
 When you need to use a tool, respond with:
 <tool_call>
