@@ -250,6 +250,19 @@ def run_tier1(args):
     print(f"  All layers:         False (embeddings/lm_head → INT8)")
     print()
 
+    # ── Monkey-patch NNCF to use FP16 inference for statistics collection ──
+    # By default NNCF uses use_fp32_precision=True which forces FP32 inference,
+    # doubling all intermediate tensor sizes. For MoE-128 models, NNCF inserts
+    # hundreds of extra Result/Output nodes that prevent OpenVINO from reusing
+    # buffers. Combined with FP32 precision, even short sequences cause OOM.
+    # FP16 inference halves memory and is sufficient for channel-magnitude stats.
+    import nncf.openvino.engine as _nncf_engine
+    _orig_engine_init = _nncf_engine.OVNativeEngine.__init__
+    def _patched_engine_init(self, model, use_fp32_precision=False):
+        _orig_engine_init(self, model, use_fp32_precision=False)
+    _nncf_engine.OVNativeEngine.__init__ = _patched_engine_init
+    print("  [PATCH] NNCF inference precision: FP16 (reduced from FP32 for MoE memory)")
+
     core = ov.Core()
     ov_model = core.read_model(str(fp16_dir / "openvino_model.xml"))
 
@@ -440,10 +453,12 @@ def _prepare_long_tool_calling_dataset(tokenizer, num_samples=32):
     - Multi-turn conversation history with tool calls and results
     - Final user instruction requiring precise tool use
 
-    Hardware constraint (32 GB RAM + 57 GB FP16 model):
-      MoE 128 experts → ~1 MB activation memory per token for FullyConnected nodes.
-      20K tokens → 20 GB allocation → OOM on 32 GB system.
-      Safe limit: 4096 tokens per sample.
+    Hardware constraint (96 GB RAM + 57 GB FP16 MoE-128 model):
+      NNCF inserts extra Result nodes for ~242 MatMul targets, preventing
+      OpenVINO buffer reuse. 144 MoE MatMuls output [128, seq_len, dim] tensors.
+      Combined memory if all alive = seq_len * 2.33 GB/Ktoken (FP16-patched).
+      Safe limit: 1024 tokens (~17 GB peak) on 96 GB system.
+      We monkey-patch NNCF to use FP16 inference (default is FP32 = 2x worse).
 
     Why this still helps despite short sequences:
       AWQ identifies important weight channels by measuring ACTIVATION MAGNITUDES.
@@ -989,18 +1004,21 @@ When you need to use a tool, respond with:
 
 Always use the most appropriate tool for the task. Do not explain what you're doing — just execute the tool call directly."""
 
-    # ── Hardware constraint ──────────────────────────────────────────────────
-    # FP16 model = 57 GB (memory-mapped). System RAM = 32 GB.
-    # NNCF statistics collection runs full forward pass on CPU.
-    # With MoE 128 experts, each token costs ~1 MB activation memory for the
-    # largest FullyConnected nodes. 20K tokens → 20 GB allocation → OOM.
+    # ── Hardware constraint (MoE-128 + NNCF statistics collection) ──────────
+    # System: 96 GB RAM, 76 GB iGPU override.
+    # FP16 model = 57 GB. NNCF statistics collection adds extra Result/Output
+    # nodes for ~242 MatMul targets in the OV graph, preventing buffer reuse.
+    # 144 MoE MatMul outputs [128, seq_len, dim] are the biggest memory hog:
+    #   seq_len=4096 + FP32: 336 GB (impossible)
+    #   seq_len=4096 + FP16: 168 GB (still too much)
+    #   seq_len=1024 + FP16:  17 GB (safe, leaves ~22 GB for model + OS)
+    #   seq_len= 512 + FP16:   8 GB (very safe)
     #
-    # Safe limit: 4096 tokens (~4 GB activation) on 32 GB RAM.
-    # AWQ value comes from CONTENT PATTERN (tool-call vs generic text),
-    # not from sequence length. OpenClaw tool-call calibration at 4K tokens
-    # is still vastly better than baseline data-free quantization.
+    # We use FP16 inference (monkey-patched above) + 1024 tokens per sample.
+    # AWQ value comes from CONTENT PATTERN (tool-call structure), not length.
+    # 1024 tokens captures system prompt + 1-2 OpenClaw exchanges = sufficient.
     # ──────────────────────────────────────────────────────────────────────────
-    MAX_SEQ_LEN = 4096
+    MAX_SEQ_LEN = 1024
 
     print(f"  Generating {num_samples} OpenClaw tool-call calibration samples (max {MAX_SEQ_LEN} tokens)...")
     calibration_data = []
