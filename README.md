@@ -64,18 +64,46 @@ Key observations:
 
 **Conclusion:** Router quantization is **NOT** the bottleneck. The degradation comes from attention layer (q/k/v/o_proj) INT4 quantization affecting the model's ability to prioritize recent instructions over extensive conversation history.
 
-### Experiment 2: High-Quality Re-Conversion (Planned)
+### Experiment 2: High-Quality Re-Conversion (Next)
 
-**Hypothesis:** Data-aware INT4 with AWQ + scale_estimation + smaller group_size will preserve attention precision better.
+**Hypothesis:** Data-aware INT4 with AWQ + scale_estimation + smaller group_size + long-context calibration data will preserve attention precision better.
 
-**Method:** Re-convert from HuggingFace weights using `convert_hq.py`:
+**Key insight from research:** Standard calibration uses short text samples (~2K tokens). But our degradation happens at 24K+. For AWQ to protect the attention weights (q/k/v/o_proj) that matter at long contexts, it must observe activations at those lengths during calibration.
+
+**Conversion plan — two variants to test:**
+
+| Variant | Method | Calibration | Key Difference |
+|---|---|---|---|
+| **INT4-HQ-T3** | Tier 3 (optimum-cli) | wikitext2, 128 samples | AWQ + scale_estimation + gs=64, no router protection |
+| **INT4-HQ** | Tier 1 (NNCF API) | `long_tool_calling`, 32 samples @ 20K+ tokens | AWQ + gs=64 + router protection + long-context agentic calibration |
+
+**Parameters (both):**
 - AWQ (Activation-aware Weight Quantization) — calibrates quantization ranges using real data
 - Scale estimation — optimizes per-channel scales
-- Group size 64 (vs baseline 128) — finer granularity
-- Sensitivity metric — protects most-sensitive layers
-- Calibration dataset — wikitext2, 128 samples
+- Group size 64 (vs baseline 128) — 2× finer granularity
+- Sensitivity metric — `max_activation_variance` (protects most-sensitive layers)
 
-**Status:** Model downloading, conversion pending.
+**Tier 1 extras:**
+- Router protection via `ignored_scope` (keeps `mlp.gate` at INT8/FP16)
+- Long-context agentic calibration: 20K+ token samples with 12 tool definitions, multi-turn tool call/result conversation history — forces AWQ to observe and protect attention patterns at the exact context lengths where degradation occurs
+- Alternative sensitivity metrics available: `hessian_input_activation`, `mean_activation_magnitude`
+
+**Status:** HF model downloaded (56.87 GB), ready for conversion.
+
+### Gemini Analysis Review
+
+We evaluated suggestions from Gemini against our actual model inspection:
+
+| Suggestion | Verdict | Evidence |
+|---|---|---|
+| Protect `gate_proj` (MoE router) | **Already tested — no effect** | Router dequant experiment proved this. Also: `gate_proj` is actually the SwiGLU gate in expert MLP, NOT the MoE router (`mlp.gate`). Gemini confused them. |
+| Protect LayerNorm weights | **Unnecessary** | Verified: LayerNorm weights are already FP32 `[1,1,2048]` constants |
+| Protect `embed_tokens`/`lm_head` | **Already done** | Baseline model has these at INT8 |
+| `hessian_trace` metric | **Doesn't exist** | NNCF has `HESSIAN_INPUT_ACTIVATION` (different). We added it as an option. |
+| Group size 64 | **Valid** ✅ | Already in our plan |
+| AWQ + scale_estimation | **Valid** ✅ | Already in our plan |
+| Long-text 20K+ calibration data | **Very valuable** ✅ | **Adopted** — added `long_tool_calling` dataset to `convert_hq.py` |
+| Ratio 0.85 (vs 0.9) | **Worth testing** | Can experiment via `--ratio 0.85` |
 
 ## Project Structure
 
@@ -144,11 +172,17 @@ python scripts/dequant_routers.py --model-dir "...\INT4" --output-dir "...\INT4-
 ### High-Quality Conversion
 
 ```bash
-# Tier 3: optimum-cli with AWQ + gs=64
+# Tier 3: optimum-cli with AWQ + gs=64 (uses local HF weights if available)
 python scripts/convert_hq.py --tier tier3
 
-# Tier 1: NNCF API with router protection + AWQ
-python scripts/convert_hq.py --tier tier1 --subset-size 64
+# Tier 3 with explicit local model path
+python scripts/convert_hq.py --tier tier3 --local-model "C:\working\models\...\HF"
+
+# Tier 1: NNCF API with router protection + long-context agentic calibration
+python scripts/convert_hq.py --tier tier1 --dataset long_tool_calling --subset-size 32
+
+# Tier 1 with hessian-based sensitivity metric
+python scripts/convert_hq.py --tier tier1 --dataset long_tool_calling --sensitivity-metric hessian_input_activation
 
 # Inspect model precision
 python scripts/convert_hq.py --inspect --model-dir "...\INT4"
@@ -175,6 +209,9 @@ python scripts/llm_code_assistant.py --task audit --device GPU --no-think
 3. **MoE router quantization is NOT the cause** — surgically dequantizing all 48 routers to FP16 had zero measurable impact
 4. **Attention layers are the likely bottleneck** — 192 INT4-quantized q/k/v/o_proj layers affect the model's attention patterns at long contexts
 5. **The failure mode is "narration"** — instead of calling the requested tool, the model analyzes and describes the code in the conversation history
+6. **LayerNorm weights are already FP32** — no need to protect them (contradicts some online advice)
+7. **Embedding/lm_head are already INT8** — the default conversion already protects these
+8. **Long-context calibration data is the key missing piece** — standard short-text calibration (wikitext2 @ 2K tokens) cannot teach AWQ about attention patterns at 24K+
 
 ## License
 

@@ -11,6 +11,7 @@ Key improvements over the default (data-free INT4_ASYM gs=128):
   - Smaller group_size (64) for finer quantization granularity
   - Data-aware AWQ + scale estimation for accuracy
   - Sensitivity-based mixed precision (most sensitive layers → INT8)
+  - Long-context (20K+) agentic calibration data for attention layer protection
 
 Tiers:
   tier3  — optimum-cli with AWQ + scale_estimation + gs=64 (fastest, no router protection)
@@ -18,7 +19,8 @@ Tiers:
 
 Usage:
     python convert_hq.py --tier tier3
-    python convert_hq.py --tier tier1 --subset-size 64
+    python convert_hq.py --tier tier3 --local-model "C:\\...\\HF"  # use local weights
+    python convert_hq.py --tier tier1 --subset-size 64 --dataset long_tool_calling
     python convert_hq.py --inspect             # inspect existing model layers
     python convert_hq.py --inspect --model-dir "C:\\working\\models\\...\\INT4-HQ"
 """
@@ -42,6 +44,7 @@ OUTPUT_DIRS = {
 }
 
 BASELINE_DIR = BASE_MODEL_DIR / "INT4"
+LOCAL_HF_DIR = BASE_MODEL_DIR / "HF"
 
 # MoE Router layer pattern — these are the 48 routing layers (one per transformer layer)
 # Node naming in OV IR: self.model.layers.{N}.mlp.gate.weight
@@ -69,6 +72,16 @@ def run_tier3(args):
 
     output_path.mkdir(parents=True, exist_ok=True)
 
+    # Determine model source: local HF dir or HuggingFace Hub
+    model_source = args.local_model or str(LOCAL_HF_DIR) if LOCAL_HF_DIR.exists() else MODEL_ID
+    if args.local_model:
+        model_source = args.local_model
+    elif LOCAL_HF_DIR.exists() and any(LOCAL_HF_DIR.glob("*.safetensors")):
+        model_source = str(LOCAL_HF_DIR)
+        print(f"[INFO] Using local HF weights: {model_source}")
+    else:
+        model_source = MODEL_ID
+
     # Find optimum-cli
     venv_dir = os.environ.get("VIRTUAL_ENV", "")
     if venv_dir:
@@ -80,16 +93,16 @@ def run_tier3(args):
 
     cmd = [
         cli_path, "export", "openvino",
-        "--model", MODEL_ID,
+        "--model", model_source,
         "--task", "text-generation-with-past",
         "--weight-format", "int4",
         "--group-size", str(args.group_size),
         "--ratio", str(args.ratio),
         "--awq",
         "--scale-estimation",
-        "--dataset", args.dataset,
+        "--dataset", args.dataset if args.dataset != "long_tool_calling" else "wikitext2",
         "--num-samples", str(args.subset_size),
-        "--sensitivity-metric", "max_activation_variance",
+        "--sensitivity-metric", args.sensitivity_metric,
         "--all-layers",
         str(output_dir),
     ]
@@ -101,7 +114,7 @@ def run_tier3(args):
     print(f"\n{'='*80}")
     print(f"  TIER 3: optimum-cli High-Quality Conversion")
     print(f"{'='*80}")
-    print(f"  Model:              {MODEL_ID}")
+    print(f"  Model:              {model_source}")
     print(f"  Output:             {output_dir}")
     print(f"  Mode:               INT4_ASYM")
     print(f"  Group size:         {args.group_size}")
@@ -110,7 +123,7 @@ def run_tier3(args):
     print(f"  Scale estimation:   True")
     print(f"  Dataset:            {args.dataset}")
     print(f"  Num samples:        {args.subset_size}")
-    print(f"  Sensitivity metric: max_activation_variance")
+    print(f"  Sensitivity metric: {args.sensitivity_metric}")
     print(f"  All layers:         True")
     print(f"  Router protection:  NO (CLI limitation)")
     print(f"{'='*80}")
@@ -161,6 +174,16 @@ def run_tier1(args):
 
     fp16_dir = BASE_MODEL_DIR / "FP16-temp"
 
+    # Determine model source for FP16 export
+    model_source = args.local_model or str(LOCAL_HF_DIR) if LOCAL_HF_DIR.exists() else MODEL_ID
+    if args.local_model:
+        model_source = args.local_model
+    elif LOCAL_HF_DIR.exists() and any(LOCAL_HF_DIR.glob("*.safetensors")):
+        model_source = str(LOCAL_HF_DIR)
+        print(f"[INFO] Using local HF weights: {model_source}")
+    else:
+        model_source = MODEL_ID
+
     if fp16_dir.exists() and any(fp16_dir.glob("*.xml")):
         print(f"[INFO] FP16 model found at {fp16_dir}, reusing.")
     else:
@@ -180,7 +203,7 @@ def run_tier1(args):
 
         cmd = [
             cli_path, "export", "openvino",
-            "--model", MODEL_ID,
+            "--model", model_source,
             "--task", "text-generation-with-past",
             "--weight-format", "fp16",
             str(fp16_dir),
@@ -221,7 +244,7 @@ def run_tier1(args):
     print(f"  AWQ:                True")
     print(f"  Scale estimation:   True")
     print(f"  Router protection:  YES (ignored_scope: {MOE_ROUTER_PATTERN})")
-    print(f"  Sensitivity metric: MAX_ACTIVATION_VARIANCE")
+    print(f"  Sensitivity metric: {args.sensitivity_metric}")
     print(f"  Backup mode:        {args.backup_precision or 'INT8_ASYM'}")
     print(f"  Subset size:        {args.subset_size}")
     print(f"  All layers:         False (embeddings/lm_head → INT8)")
@@ -237,6 +260,16 @@ def run_tier1(args):
     elif args.backup_precision == "none":
         backup = BackupMode.NONE
 
+    # Parse sensitivity metric
+    metric_map = {
+        "max_activation_variance": SensitivityMetric.MAX_ACTIVATION_VARIANCE,
+        "mean_activation_variance": SensitivityMetric.MEAN_ACTIVATION_VARIANCE,
+        "mean_activation_magnitude": SensitivityMetric.MEAN_ACTIVATION_MAGNITUDE,
+        "hessian_input_activation": SensitivityMetric.HESSIAN_INPUT_ACTIVATION,
+        "weight_quantization_error": SensitivityMetric.WEIGHT_QUANTIZATION_ERROR,
+    }
+    sensitivity = metric_map.get(args.sensitivity_metric, SensitivityMetric.MAX_ACTIVATION_VARIANCE)
+
     start = time.time()
     compressed_model = compress_weights(
         ov_model,
@@ -245,7 +278,7 @@ def run_tier1(args):
         ratio=args.ratio,
         ignored_scope=nncf.IgnoredScope(patterns=[MOE_ROUTER_PATTERN]),
         dataset=nncf_dataset,
-        sensitivity_metric=SensitivityMetric.MAX_ACTIVATION_VARIANCE,
+        sensitivity_metric=sensitivity,
         subset_size=args.subset_size,
         awq=True,
         scale_estimation=True,
@@ -290,8 +323,11 @@ def _prepare_calibration_dataset(tokenizer, dataset_name="wikitext2", num_sample
     """Prepare calibration dataset for NNCF data-aware compression."""
 
     if dataset_name == "tool_calling":
-        # Custom tool-calling calibration data
+        # Short tool-calling calibration data (~4K tokens per sample)
         return _prepare_tool_calling_dataset(tokenizer, num_samples)
+    elif dataset_name == "long_tool_calling":
+        # Long-context agentic calibration data (~20K+ tokens per sample)
+        return _prepare_long_tool_calling_dataset(tokenizer, num_samples)
 
     # Default: use wikitext2 via HuggingFace datasets
     from datasets import load_dataset
@@ -384,6 +420,320 @@ When you need to use a tool, respond with:
             break
 
     print(f"  Collected {len(calibration_data)} tool-calling calibration samples")
+    return calibration_data
+
+
+def _prepare_long_tool_calling_dataset(tokenizer, num_samples=32):
+    """
+    Create long-context (20K+ token) agentic calibration samples.
+
+    This is critical for AWQ to properly protect attention weights at long contexts.
+    Each sample simulates a real agentic coding assistant conversation with:
+    - Complex system prompt with 12 tool definitions
+    - Multi-turn conversation history with tool calls and results
+    - Final user instruction requiring precise tool use
+
+    The long-context activations help NNCF identify which weights are most sensitive
+    to quantization in the attention layers (q/k/v/o_proj) at extended contexts.
+    """
+    import json
+    import random
+
+    TOOL_DEFINITIONS = [
+        {"name": "read_file", "description": "Read the contents of a file at the specified path",
+         "parameters": {"type": "object", "properties": {
+             "path": {"type": "string", "description": "Path to the file"},
+             "start_line": {"type": "integer", "description": "Starting line number (1-based)"},
+             "end_line": {"type": "integer", "description": "Ending line number (1-based, inclusive)"}
+         }, "required": ["path"]}},
+        {"name": "search_code", "description": "Search for code patterns using regex",
+         "parameters": {"type": "object", "properties": {
+             "pattern": {"type": "string", "description": "Regex pattern to search for"},
+             "path": {"type": "string", "description": "Directory or file to search in"},
+             "include": {"type": "string", "description": "Glob pattern for files to include"}
+         }, "required": ["pattern"]}},
+        {"name": "replace_in_file", "description": "Replace text in a file",
+         "parameters": {"type": "object", "properties": {
+             "path": {"type": "string", "description": "Path to the file"},
+             "old_text": {"type": "string", "description": "Exact text to find"},
+             "new_text": {"type": "string", "description": "Replacement text"}
+         }, "required": ["path", "old_text", "new_text"]}},
+        {"name": "run_command", "description": "Execute a shell command",
+         "parameters": {"type": "object", "properties": {
+             "command": {"type": "string", "description": "Shell command to execute"},
+             "cwd": {"type": "string", "description": "Working directory"},
+             "timeout": {"type": "integer", "description": "Timeout in seconds"}
+         }, "required": ["command"]}},
+        {"name": "write_file", "description": "Write content to a file",
+         "parameters": {"type": "object", "properties": {
+             "path": {"type": "string", "description": "Path to the file"},
+             "content": {"type": "string", "description": "Content to write"}
+         }, "required": ["path", "content"]}},
+        {"name": "list_directory", "description": "List contents of a directory",
+         "parameters": {"type": "object", "properties": {
+             "path": {"type": "string", "description": "Directory path"},
+             "recursive": {"type": "boolean", "description": "Whether to list recursively"}
+         }, "required": ["path"]}},
+        {"name": "get_diagnostics", "description": "Get compiler/linter errors for a file",
+         "parameters": {"type": "object", "properties": {
+             "path": {"type": "string", "description": "File path to check"}
+         }, "required": ["path"]}},
+        {"name": "apply_diff", "description": "Apply a unified diff to a file",
+         "parameters": {"type": "object", "properties": {
+             "path": {"type": "string", "description": "File to patch"},
+             "diff": {"type": "string", "description": "Unified diff content"}
+         }, "required": ["path", "diff"]}},
+        {"name": "create_file", "description": "Create a new file with content",
+         "parameters": {"type": "object", "properties": {
+             "path": {"type": "string", "description": "Path for the new file"},
+             "content": {"type": "string", "description": "File content"}
+         }, "required": ["path", "content"]}},
+        {"name": "delete_file", "description": "Delete a file or directory",
+         "parameters": {"type": "object", "properties": {
+             "path": {"type": "string", "description": "Path to delete"},
+             "recursive": {"type": "boolean", "description": "Delete recursively"}
+         }, "required": ["path"]}},
+        {"name": "web_search", "description": "Search the web for information",
+         "parameters": {"type": "object", "properties": {
+             "query": {"type": "string", "description": "Search query"},
+             "num_results": {"type": "integer", "description": "Number of results"}
+         }, "required": ["query"]}},
+        {"name": "manage_todos", "description": "Manage task tracking",
+         "parameters": {"type": "object", "properties": {
+             "action": {"type": "string", "enum": ["add", "complete", "list"]},
+             "title": {"type": "string"}, "id": {"type": "integer"}
+         }, "required": ["action"]}},
+    ]
+
+    # Code snippets for realistic tool call/result padding
+    CODE_SNIPPETS = [
+        '''def process_data(items: list[dict]) -> list[dict]:
+    """Process and validate data items."""
+    results = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if "id" not in item or "value" not in item:
+            continue
+        processed = {
+            "id": item["id"],
+            "value": float(item["value"]),
+            "normalized": float(item["value"]) / 100.0,
+            "status": "valid" if float(item["value"]) > 0 else "invalid",
+        }
+        results.append(processed)
+    return results''',
+        '''class DatabaseConnection:
+    """Manages database connection pooling."""
+    def __init__(self, host: str, port: int = 5432, max_connections: int = 10):
+        self.host = host
+        self.port = port
+        self.max_connections = max_connections
+        self._pool = []
+        self._active = 0
+
+    async def acquire(self):
+        if self._pool:
+            conn = self._pool.pop()
+            self._active += 1
+            return conn
+        if self._active < self.max_connections:
+            conn = await self._create_connection()
+            self._active += 1
+            return conn
+        raise RuntimeError("Connection pool exhausted")
+
+    async def release(self, conn):
+        self._active -= 1
+        self._pool.append(conn)''',
+        '''import logging
+from pathlib import Path
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+def find_config(start_dir: str, filename: str = "config.yaml") -> Optional[Path]:
+    """Walk up directory tree to find configuration file."""
+    current = Path(start_dir).resolve()
+    while current != current.parent:
+        candidate = current / filename
+        if candidate.exists():
+            logger.info(f"Found config at {candidate}")
+            return candidate
+        current = current.parent
+    logger.warning(f"Config {filename} not found starting from {start_dir}")
+    return None''',
+        '''async function fetchWithRetry(url, options = {}, maxRetries = 3) {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const response = await fetch(url, {
+        ...options,
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return await response.json();
+    } catch (error) {
+      if (attempt === maxRetries - 1) throw error;
+      await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
+    }
+  }
+}''',
+        '''#include <vector>
+#include <algorithm>
+#include <numeric>
+
+template<typename T>
+class SlidingWindow {
+    std::vector<T> buffer_;
+    size_t capacity_;
+    size_t head_ = 0;
+    size_t count_ = 0;
+public:
+    explicit SlidingWindow(size_t capacity) : buffer_(capacity), capacity_(capacity) {}
+
+    void push(T value) {
+        buffer_[head_] = std::move(value);
+        head_ = (head_ + 1) % capacity_;
+        if (count_ < capacity_) ++count_;
+    }
+
+    T average() const {
+        if (count_ == 0) return T{};
+        return std::accumulate(buffer_.begin(), buffer_.begin() + count_, T{}) / count_;
+    }
+};''',
+    ]
+
+    # Tool call/result conversation fragments
+    TOOL_CALL_EXCHANGES = [
+        (
+            {"name": "read_file", "arguments": {"path": "src/main.py", "start_line": 1, "end_line": 50}},
+            "File contents:\n```python\nimport sys\nfrom pathlib import Path\n\ndef main():\n    parser = argparse.ArgumentParser()\n    parser.add_argument('--config', type=str, required=True)\n    args = parser.parse_args()\n    config = load_config(args.config)\n    app = Application(config)\n    app.run()\n\nif __name__ == '__main__':\n    main()\n```"
+        ),
+        (
+            {"name": "search_code", "arguments": {"pattern": "def\\s+\\w+\\(.*\\)\\s*->", "path": "src/", "include": "*.py"}},
+            "Found 15 matches:\nsrc/main.py:4: def main() -> None:\nsrc/utils.py:12: def load_config(path: str) -> dict:\nsrc/utils.py:28: def validate_schema(data: dict) -> bool:\nsrc/db.py:8: def connect(url: str) -> Connection:\nsrc/db.py:45: def execute_query(conn: Connection, query: str) -> list:"
+        ),
+        (
+            {"name": "list_directory", "arguments": {"path": ".", "recursive": False}},
+            "Contents:\n  src/\n  tests/\n  docs/\n  config.yaml\n  pyproject.toml\n  README.md\n  .gitignore\n  Makefile"
+        ),
+        (
+            {"name": "run_command", "arguments": {"command": "python -m pytest tests/ -v --tb=short", "cwd": ".", "timeout": 60}},
+            "===== test session starts =====\ncollected 24 items\ntests/test_main.py::test_init PASSED\ntests/test_main.py::test_config_loading PASSED\ntests/test_utils.py::test_validate_schema PASSED\ntests/test_utils.py::test_load_config FAILED\ntests/test_db.py::test_connection PASSED\n===== 1 failed, 23 passed in 2.34s ====="
+        ),
+        (
+            {"name": "get_diagnostics", "arguments": {"path": "src/utils.py"}},
+            "Diagnostics for src/utils.py:\n  Line 15: W0611 - Unused import 'os'\n  Line 32: E1101 - Instance of 'dict' has no 'validate' member\n  Line 48: C0301 - Line too long (127/120)"
+        ),
+        (
+            {"name": "replace_in_file", "arguments": {"path": "src/utils.py", "old_text": "import os\nimport sys", "new_text": "import sys"}},
+            "Successfully replaced text in src/utils.py (1 occurrence)"
+        ),
+        (
+            {"name": "write_file", "arguments": {"path": "tests/test_new.py", "content": "import pytest\nfrom src.utils import validate_schema\n\ndef test_empty_schema():\n    assert validate_schema({}) is False\n"}},
+            "File written successfully: tests/test_new.py (5 lines)"
+        ),
+        (
+            {"name": "web_search", "arguments": {"query": "python asyncio best practices 2026", "num_results": 5}},
+            "Results:\n1. 'Modern Asyncio Patterns in Python 3.12+' - realpython.com\n2. 'Asyncio Task Groups and Exception Handling' - docs.python.org\n3. 'Performance Tips for Python Async IO' - stackoverflow.com"
+        ),
+    ]
+
+    # User requests that require specific tool calls as responses
+    FINAL_REQUESTS = [
+        ("Read the file src/config.py starting from line 45 to line 90.",
+         {"name": "read_file", "arguments": {"path": "src/config.py", "start_line": 45, "end_line": 90}}),
+        ("Search for all TODO comments in the source code.",
+         {"name": "search_code", "arguments": {"pattern": "TODO|FIXME|HACK", "path": "src/", "include": "*.py"}}),
+        ("Replace the deprecated API call in src/api.py.",
+         {"name": "replace_in_file", "arguments": {"path": "src/api.py", "old_text": "requests.get(url)", "new_text": "httpx.get(url)"}}),
+        ("Run the linter on the entire project.",
+         {"name": "run_command", "arguments": {"command": "python -m ruff check src/ --fix", "cwd": "."}}),
+        ("Check for any type errors in the database module.",
+         {"name": "get_diagnostics", "arguments": {"path": "src/db.py"}}),
+        ("Create a new test file for the config module.",
+         {"name": "create_file", "arguments": {"path": "tests/test_config.py", "content": "import pytest\nfrom src.config import Config\n"}}),
+        ("List all files in the deployment directory.",
+         {"name": "list_directory", "arguments": {"path": "deploy/", "recursive": True}}),
+        ("Apply the diff to fix the import ordering issue.",
+         {"name": "apply_diff", "arguments": {"path": "src/main.py", "diff": "--- a/src/main.py\n+++ b/src/main.py\n@@ -1,3 +1,3 @@\n-import sys\n-import os\n+import os\n+import sys\n"}}),
+    ]
+
+    system_prompt = f"""You are an expert coding assistant with access to the following tools:
+
+<tools>
+{json.dumps(TOOL_DEFINITIONS, indent=2)}
+</tools>
+
+When you need to use a tool, respond with:
+<tool_call>
+{{"name": "tool_name", "arguments": {{"param1": "value1"}}}}
+</tool_call>
+
+Always use the most appropriate tool for the task. Do not explain what you're doing — just execute the tool call directly."""
+
+    print(f"  Generating {num_samples} long-context agentic calibration samples (~20K+ tokens each)...")
+    calibration_data = []
+
+    for i in range(num_samples):
+        random.seed(42 + i)  # Reproducible but varied
+        messages = [{"role": "system", "content": system_prompt}]
+
+        # Build multi-turn history with tool calls and results
+        # Target: fill ~18K tokens of history, then add final request
+        num_exchanges = random.randint(8, 14)
+        used_exchanges = random.choices(TOOL_CALL_EXCHANGES, k=num_exchanges)
+
+        for tc_args, result_text in used_exchanges:
+            # User request that led to this tool call
+            messages.append({"role": "user", "content": f"Please help me with the codebase. " +
+                           random.choice([
+                               "I need to understand the project structure.",
+                               "Let's fix the failing tests.",
+                               "I want to refactor the database module.",
+                               "Can you help debug this issue?",
+                               "Let's improve the error handling.",
+                               "I need to add a new feature for data export.",
+                               "Please check the code quality.",
+                               "Let's optimize the API response time.",
+                           ])})
+
+            # Assistant tool call
+            tc_json = json.dumps(tc_args)
+            messages.append({"role": "assistant", "content": f"<tool_call>\n{tc_json}\n</tool_call>"})
+
+            # Tool result (with code snippet padding for realism)
+            code_pad = random.choice(CODE_SNIPPETS)
+            full_result = result_text + "\n\nRelated code context:\n```\n" + code_pad + "\n```"
+            messages.append({"role": "user", "content": f"[Tool Result]\n{full_result}"})
+
+            # Assistant analysis
+            messages.append({"role": "assistant", "content": random.choice([
+                "I see. Let me continue examining the codebase to address your request.",
+                "Based on this result, I'll proceed with the next step.",
+                "Got it. Let me check another part of the code that might be related.",
+                "This confirms my suspicion. Let me investigate further.",
+                "The output shows some areas that need attention. Let me look deeper.",
+            ])})
+
+        # Final user request — this is what the model must respond to correctly
+        final_req, expected_tc = random.choice(FINAL_REQUESTS)
+        messages.append({"role": "user", "content": final_req})
+
+        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        # Add the expected correct response for the calibration
+        text += f"<tool_call>\n{json.dumps(expected_tc)}\n</tool_call>"
+
+        inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=24576)
+        token_len = inputs["input_ids"].shape[1]
+        calibration_data.append(dict(inputs))
+
+        if i == 0:
+            print(f"    Sample 0: {token_len} tokens")
+
+    avg_len = sum(d["input_ids"].shape[1] for d in calibration_data) / len(calibration_data)
+    print(f"  Collected {len(calibration_data)} long-context samples (avg {avg_len:.0f} tokens)")
     return calibration_data
 
 
@@ -521,10 +871,17 @@ def main():
     parser.add_argument("--ratio", type=float, default=0.9,
                         help="INT4 vs INT8 ratio (default: 0.9)")
     parser.add_argument("--dataset", type=str, default="wikitext2",
-                        choices=["wikitext2", "tool_calling"],
+                        choices=["wikitext2", "tool_calling", "long_tool_calling"],
                         help="Calibration dataset (default: wikitext2)")
     parser.add_argument("--subset-size", type=int, default=128,
                         help="Number of calibration samples (default: 128)")
+    parser.add_argument("--sensitivity-metric", type=str, default="max_activation_variance",
+                        choices=["max_activation_variance", "mean_activation_variance",
+                                 "mean_activation_magnitude", "hessian_input_activation",
+                                 "weight_quantization_error"],
+                        help="Sensitivity metric for mixed-precision (default: max_activation_variance)")
+    parser.add_argument("--local-model", type=str, default=None,
+                        help="Path to local HuggingFace model weights (skip download)")
     parser.add_argument("--backup-precision", type=str, default=None,
                         choices=["int8_sym", "int8_asym", "none"],
                         help="Backup precision for non-INT4 layers")
