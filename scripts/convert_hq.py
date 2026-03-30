@@ -1044,13 +1044,14 @@ Always use the most appropriate tool for the task. Do not explain what you're do
 
             # Tool result (with heavier code snippet padding for realism)
             # Use multiple snippets concatenated for longer samples to fill context
-            num_pads = 2 if target_len >= 49152 else 1
+            # All targets need at least 2 pads + extra block to reach target length
+            # Each exchange ≈ 1000-1200 tokens with this padding level
+            num_pads = 3 if target_len >= 49152 else 2
             code_pads = random.choices(all_snippets, k=num_pads)
             full_result = result_text + "\n\nRelated code context:\n```\n" + "\n\n".join(code_pads) + "\n```"
-            # For 48K+, also append a secondary code block to bulk up the result
-            if target_len >= 32768:
-                extra = random.choice(all_snippets)
-                full_result += f"\n\nAlso found in a related module:\n```\n{extra}\n```"
+            # Always append a secondary code block to ensure each exchange is long enough
+            extra = random.choice(all_snippets)
+            full_result += f"\n\nAlso found in a related module:\n```\n{extra}\n```"
             messages.append({"role": "user", "content": f"[Tool Result]\n{full_result}"})
 
             # Assistant analysis
