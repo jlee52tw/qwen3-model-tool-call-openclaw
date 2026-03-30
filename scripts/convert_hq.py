@@ -425,13 +425,24 @@ When you need to use a tool, respond with:
 
 def _prepare_long_tool_calling_dataset(tokenizer, num_samples=32):
     """
-    Create long-context (20K+ token) agentic calibration samples.
+    Create mixed-length long-context (24K-64K token) agentic calibration samples.
 
     This is critical for AWQ to properly protect attention weights at long contexts.
     Each sample simulates a real agentic coding assistant conversation with:
     - Complex system prompt with 12 tool definitions
     - Multi-turn conversation history with tool calls and results
     - Final user instruction requiring precise tool use
+
+    Samples are distributed across 4 target lengths to cover the full
+    agentic coding assistant working range:
+      - 24K tokens: 5-7 turn coding session (most common degradation point)
+      - 32K tokens: 7-10 turn session (critical for tool-call accuracy)
+      - 48K tokens: 10-15 turn deep debug/refactor session
+      - 64K tokens: 15-20 turn complex multi-file session
+
+    Memory justification (Qwen3-30B-A3B on 27.5 GB iGPU):
+      KV cache = 96 KB/token (GQA 4 KV heads), so:
+      64K tokens = 6 GB KV + 15.3 GB weights = 21.3 GB → fits comfortably
 
     The long-context activations help NNCF identify which weights are most sensitive
     to quantization in the attention layers (q/k/v/o_proj) at extended contexts.
@@ -604,6 +615,206 @@ public:
 };''',
     ]
 
+    # Additional longer code snippets for 48K/64K samples
+    LONG_CODE_SNIPPETS = [
+        '''class EventBus:
+    """Publish-subscribe event system with async support."""
+    def __init__(self):
+        self._handlers: dict[str, list[callable]] = {}
+        self._middleware: list[callable] = []
+
+    def on(self, event: str, handler: callable):
+        if event not in self._handlers:
+            self._handlers[event] = []
+        self._handlers[event].append(handler)
+        return self
+
+    def use(self, middleware: callable):
+        self._middleware.append(middleware)
+        return self
+
+    async def emit(self, event: str, data: dict = None):
+        context = {"event": event, "data": data or {}, "cancelled": False}
+        for mw in self._middleware:
+            await mw(context)
+            if context["cancelled"]:
+                return
+        for handler in self._handlers.get(event, []):
+            await handler(context["data"])
+
+    def off(self, event: str, handler: callable = None):
+        if handler is None:
+            self._handlers.pop(event, None)
+        elif event in self._handlers:
+            self._handlers[event] = [h for h in self._handlers[event] if h != handler]''',
+        '''from dataclasses import dataclass, field
+from typing import Generic, TypeVar
+from collections import defaultdict
+import heapq
+
+T = TypeVar("T")
+
+@dataclass(order=True)
+class PriorityItem(Generic[T]):
+    priority: int
+    item: T = field(compare=False)
+
+class TaskScheduler:
+    """Priority-based task scheduler with dependency tracking."""
+    def __init__(self):
+        self._queue: list[PriorityItem] = []
+        self._dependencies: dict[str, set[str]] = defaultdict(set)
+        self._completed: set[str] = set()
+        self._blocked: dict[str, set[str]] = defaultdict(set)
+
+    def add_task(self, task_id: str, priority: int = 0, depends_on: list[str] = None):
+        if depends_on:
+            pending = {d for d in depends_on if d not in self._completed}
+            if pending:
+                self._blocked[task_id] = pending
+                self._dependencies[task_id] = pending
+                for dep in pending:
+                    self._blocked.setdefault(dep, set())
+                return
+        heapq.heappush(self._queue, PriorityItem(priority, task_id))
+
+    def complete(self, task_id: str):
+        self._completed.add(task_id)
+        for blocked_task, deps in list(self._blocked.items()):
+            deps.discard(task_id)
+            if not deps and blocked_task not in self._completed:
+                orig_deps = self._dependencies.get(blocked_task, set())
+                heapq.heappush(self._queue, PriorityItem(0, blocked_task))
+                del self._blocked[blocked_task]
+
+    def next(self) -> str | None:
+        while self._queue:
+            item = heapq.heappop(self._queue)
+            if item.item not in self._completed:
+                return item.item
+        return None''',
+        '''// React component with complex state management
+import React, { useReducer, useCallback, useMemo, useEffect } from "react";
+
+interface AppState {
+  items: Array<{ id: string; name: string; status: "pending" | "active" | "done" }>;
+  filter: "all" | "pending" | "active" | "done";
+  searchQuery: string;
+  selectedIds: Set<string>;
+  isLoading: boolean;
+  error: string | null;
+}
+
+type Action =
+  | { type: "SET_ITEMS"; payload: AppState["items"] }
+  | { type: "UPDATE_STATUS"; id: string; status: AppState["items"][0]["status"] }
+  | { type: "SET_FILTER"; filter: AppState["filter"] }
+  | { type: "TOGGLE_SELECT"; id: string }
+  | { type: "SET_SEARCH"; query: string }
+  | { type: "SET_LOADING"; loading: boolean }
+  | { type: "SET_ERROR"; error: string | null }
+  | { type: "BULK_UPDATE"; ids: string[]; status: AppState["items"][0]["status"] };
+
+function reducer(state: AppState, action: Action): AppState {
+  switch (action.type) {
+    case "SET_ITEMS":
+      return { ...state, items: action.payload, isLoading: false };
+    case "UPDATE_STATUS":
+      return {
+        ...state,
+        items: state.items.map((item) =>
+          item.id === action.id ? { ...item, status: action.status } : item
+        ),
+      };
+    case "SET_FILTER":
+      return { ...state, filter: action.filter };
+    case "TOGGLE_SELECT": {
+      const newSelected = new Set(state.selectedIds);
+      newSelected.has(action.id) ? newSelected.delete(action.id) : newSelected.add(action.id);
+      return { ...state, selectedIds: newSelected };
+    }
+    case "SET_SEARCH":
+      return { ...state, searchQuery: action.query };
+    case "BULK_UPDATE":
+      return {
+        ...state,
+        items: state.items.map((item) =>
+          action.ids.includes(item.id) ? { ...item, status: action.status } : item
+        ),
+        selectedIds: new Set(),
+      };
+    default:
+      return state;
+  }
+}''',
+        '''# Kubernetes deployment manifest for a microservice
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  namespace: production
+  labels:
+    app: api-gateway
+    version: v2.1.0
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: api-gateway
+  template:
+    metadata:
+      labels:
+        app: api-gateway
+        version: v2.1.0
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      serviceAccountName: api-gateway-sa
+      containers:
+      - name: api-gateway
+        image: registry.internal/api-gateway:v2.1.0
+        ports:
+        - containerPort: 8080
+          name: http
+        - containerPort: 9090
+          name: metrics
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+          initialDelaySeconds: 15
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: api-gateway-secrets
+              key: database-url
+        - name: REDIS_HOST
+          value: "redis-cluster.production.svc.cluster.local"
+        - name: LOG_LEVEL
+          value: "info"''',
+    ]
+
     # Tool call/result conversation fragments
     TOOL_CALL_EXCHANGES = [
         (
@@ -673,17 +884,33 @@ When you need to use a tool, respond with:
 
 Always use the most appropriate tool for the task. Do not explain what you're doing — just execute the tool call directly."""
 
-    print(f"  Generating {num_samples} long-context agentic calibration samples (~20K+ tokens each)...")
+    print(f"  Generating {num_samples} mixed-length agentic calibration samples (24K-64K tokens)...")
     calibration_data = []
+
+    # Distribute samples across target lengths: 24K, 32K, 48K, 64K
+    TARGET_LENGTHS = [24576, 32768, 49152, 65536]
+    # Corresponding exchange counts to reach target length
+    # Each exchange ≈ 1200-2000 tokens (user + tool_call + tool_result + analysis)
+    EXCHANGE_RANGES = {
+        24576: (8, 14),    # 8-14 exchanges → ~16-22K of history
+        32768: (14, 20),   # 14-20 exchanges → ~22-32K of history
+        49152: (22, 32),   # 22-32 exchanges → ~34-50K of history
+        65536: (32, 42),   # 32-42 exchanges → ~50-66K of history
+    }
 
     for i in range(num_samples):
         random.seed(42 + i)  # Reproducible but varied
+        target_len = TARGET_LENGTHS[i % len(TARGET_LENGTHS)]
+        min_ex, max_ex = EXCHANGE_RANGES[target_len]
+
         messages = [{"role": "system", "content": system_prompt}]
 
         # Build multi-turn history with tool calls and results
-        # Target: fill ~18K tokens of history, then add final request
-        num_exchanges = random.randint(8, 14)
+        num_exchanges = random.randint(min_ex, max_ex)
         used_exchanges = random.choices(TOOL_CALL_EXCHANGES, k=num_exchanges)
+
+        # For longer samples, also use the longer code snippets
+        all_snippets = CODE_SNIPPETS + (LONG_CODE_SNIPPETS if target_len >= 32768 else [])
 
         for tc_args, result_text in used_exchanges:
             # User request that led to this tool call
@@ -697,6 +924,10 @@ Always use the most appropriate tool for the task. Do not explain what you're do
                                "I need to add a new feature for data export.",
                                "Please check the code quality.",
                                "Let's optimize the API response time.",
+                               "Can you review the security of this module?",
+                               "I need to add proper logging throughout.",
+                               "Let's set up the CI/CD pipeline configuration.",
+                               "Can you help migrate this to async/await?",
                            ])})
 
             # Assistant tool call
@@ -704,7 +935,7 @@ Always use the most appropriate tool for the task. Do not explain what you're do
             messages.append({"role": "assistant", "content": f"<tool_call>\n{tc_json}\n</tool_call>"})
 
             # Tool result (with code snippet padding for realism)
-            code_pad = random.choice(CODE_SNIPPETS)
+            code_pad = random.choice(all_snippets)
             full_result = result_text + "\n\nRelated code context:\n```\n" + code_pad + "\n```"
             messages.append({"role": "user", "content": f"[Tool Result]\n{full_result}"})
 
@@ -715,6 +946,9 @@ Always use the most appropriate tool for the task. Do not explain what you're do
                 "Got it. Let me check another part of the code that might be related.",
                 "This confirms my suspicion. Let me investigate further.",
                 "The output shows some areas that need attention. Let me look deeper.",
+                "Good. I found what I was looking for. Let me now check the related module.",
+                "I notice a pattern here. Let me verify by checking a few more files.",
+                "The test results suggest we need to update the implementation. Let me trace the issue.",
             ])})
 
         # Final user request — this is what the model must respond to correctly
@@ -725,15 +959,24 @@ Always use the most appropriate tool for the task. Do not explain what you're do
         # Add the expected correct response for the calibration
         text += f"<tool_call>\n{json.dumps(expected_tc)}\n</tool_call>"
 
-        inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=24576)
+        inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=target_len)
         token_len = inputs["input_ids"].shape[1]
         calibration_data.append(dict(inputs))
 
-        if i == 0:
-            print(f"    Sample 0: {token_len} tokens")
+        if i < 4:  # Print first sample of each target length
+            print(f"    Sample {i} (target {target_len//1024}K): {token_len} tokens")
+
+    # Summary by target length
+    by_target = {}
+    for i, d in enumerate(calibration_data):
+        t = TARGET_LENGTHS[i % len(TARGET_LENGTHS)]
+        by_target.setdefault(t, []).append(d["input_ids"].shape[1])
+    for t in sorted(by_target):
+        lens = by_target[t]
+        print(f"    {t//1024}K target: {len(lens)} samples, avg {sum(lens)/len(lens):.0f} tokens")
 
     avg_len = sum(d["input_ids"].shape[1] for d in calibration_data) / len(calibration_data)
-    print(f"  Collected {len(calibration_data)} long-context samples (avg {avg_len:.0f} tokens)")
+    print(f"  Collected {len(calibration_data)} mixed-length samples (overall avg {avg_len:.0f} tokens)")
     return calibration_data
 
 
