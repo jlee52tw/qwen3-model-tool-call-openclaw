@@ -241,7 +241,7 @@ def run_tier1(args):
     print(f"  Mode:               INT4_ASYM")
     print(f"  Group size:         {args.group_size}")
     print(f"  Ratio:              {args.ratio}")
-    print(f"  AWQ:                True")
+    print(f"  AWQ:                {args.awq}")
     print(f"  Scale estimation:   True")
     print(f"  Router protection:  YES (ignored_scope: {MOE_ROUTER_PATTERN})")
     print(f"  Sensitivity metric: {args.sensitivity_metric}")
@@ -293,7 +293,7 @@ def run_tier1(args):
         dataset=nncf_dataset,
         sensitivity_metric=sensitivity,
         subset_size=args.subset_size,
-        awq=True,
+        awq=args.awq,
         scale_estimation=True,
         gptq=False,
         lora_correction=False,
@@ -1232,10 +1232,10 @@ def main():
                         help=f"Model directory for inspection (default: {BASELINE_DIR})")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Override output directory")
-    parser.add_argument("--group-size", type=int, default=64,
-                        help="Quantization group size (default: 64)")
-    parser.add_argument("--ratio", type=float, default=0.9,
-                        help="INT4 vs INT8 ratio (default: 0.9)")
+    parser.add_argument("--group-size", type=int, default=128,
+                        help="Quantization group size (default: 128, only gs=128 works on Arc B390 GPU)")
+    parser.add_argument("--ratio", type=float, default=0.8,
+                        help="INT4 vs INT8 ratio (default: 0.8, lower = more INT8 for sensitive layers)")
     parser.add_argument("--dataset", type=str, default="wikitext2",
                         choices=["wikitext2", "tool_calling", "long_tool_calling"],
                         help="Calibration dataset (default: wikitext2)")
@@ -1248,6 +1248,8 @@ def main():
                         help="Sensitivity metric for mixed-precision (default: max_activation_variance)")
     parser.add_argument("--local-model", type=str, default=None,
                         help="Path to local HuggingFace model weights (skip download)")
+    parser.add_argument("--awq", action="store_true", default=False,
+                        help="Enable AWQ (BROKEN for MoE models in NNCF 2.19.0, use with caution)")
     parser.add_argument("--backup-precision", type=str, default=None,
                         choices=["int8_sym", "int8_asym", "none"],
                         help="Backup precision for non-INT4 layers")
