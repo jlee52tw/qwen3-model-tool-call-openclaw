@@ -1100,6 +1100,78 @@ Always use the most appropriate tool for the task. Do not explain what you're do
 
     avg_len = sum(d["input_ids"].shape[1] for d in calibration_data) / len(calibration_data)
     print(f"  Collected {len(calibration_data)} samples (avg {avg_len:.0f} tokens, max {MAX_SEQ_LEN})")
+
+    # ── Save generated prompts to disk for inspection ─────────────────────────
+    # Regenerate the text prompts (same seeds) and write to calibration_prompts/
+    prompts_dir = BASE_MODEL_DIR / "calibration_prompts"
+    prompts_dir.mkdir(parents=True, exist_ok=True)
+    print(f"\n  Saving generated prompts to: {prompts_dir}")
+
+    prompt_manifest = []
+    for i in range(len(calibration_data)):
+        random.seed(42 + i)  # Same seed as above → identical content
+
+        messages = [{"role": "system", "content": system_prompt}]
+        num_exchanges = random.randint(*EXCHANGE_RANGE)
+        used_exchanges = random.choices(TOOL_CALL_EXCHANGES, k=num_exchanges)
+
+        for tc_args, result_text in used_exchanges:
+            messages.append({"role": "user", "content": f"Please help me with the codebase. " +
+                           random.choice([
+                               "I need to understand the project structure.",
+                               "Let's fix the failing tests.",
+                               "I want to refactor the database module.",
+                               "Can you help debug this issue?",
+                               "Let's improve the error handling.",
+                               "I need to add a new feature for data export.",
+                               "Please check the code quality.",
+                               "Let's optimize the API response time.",
+                               "Can you review the security of this module?",
+                               "I need to add proper logging throughout.",
+                               "Let's set up the CI/CD pipeline configuration.",
+                               "Can you help migrate this to async/await?",
+                           ])})
+            tc_json = json.dumps(tc_args)
+            messages.append({"role": "assistant", "content": f"<tool_call>\n{tc_json}\n</tool_call>"})
+            code_pad = random.choice(all_snippets)
+            full_result = result_text + "\n\nRelated code context:\n```\n" + code_pad + "\n```"
+            messages.append({"role": "user", "content": f"[Tool Result]\n{full_result}"})
+            messages.append({"role": "assistant", "content": random.choice([
+                "I see. Let me continue examining the codebase to address your request.",
+                "Based on this result, I'll proceed with the next step.",
+                "Got it. Let me check another part of the code that might be related.",
+                "This confirms my suspicion. Let me investigate further.",
+                "The output shows some areas that need attention. Let me look deeper.",
+                "Good. I found what I was looking for. Let me now check the related module.",
+                "I notice a pattern here. Let me verify by checking a few more files.",
+                "The test results suggest we need to update the implementation. Let me trace the issue.",
+            ])})
+
+        final_req, expected_tc = random.choice(FINAL_REQUESTS)
+        messages.append({"role": "user", "content": final_req})
+
+        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        text += f"<tool_call>\n{json.dumps(expected_tc)}\n</tool_call>"
+
+        token_len = calibration_data[i]["input_ids"].shape[1]
+        prompt_file = prompts_dir / f"sample_{i:03d}.txt"
+        prompt_file.write_text(text, encoding="utf-8")
+
+        prompt_manifest.append({
+            "sample": i,
+            "file": prompt_file.name,
+            "token_len": token_len,
+            "num_exchanges": num_exchanges,
+            "final_request": final_req,
+            "expected_tool_call": expected_tc,
+            "char_len": len(text),
+        })
+
+    # Write manifest summary
+    manifest_file = prompts_dir / "manifest.json"
+    manifest_file.write_text(json.dumps(prompt_manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"  Saved {len(prompt_manifest)} prompt files + manifest.json to {prompts_dir}")
+
     return calibration_data
 
 
