@@ -446,27 +446,34 @@ When you need to use a tool, respond with:
 
 def _prepare_long_tool_calling_dataset(tokenizer, num_samples=32):
     """
-    Create OpenClaw v2026 tool-calling calibration samples for AWQ/scale_estimation.
+    Create OpenClaw v2026 tool-calling calibration samples for scale_estimation.
 
     Each sample simulates a real OpenClaw agentic session with:
-    - OpenClaw system prompt with 20 tool definitions (read, write, edit, exec, etc.)
-    - Multi-turn conversation history with tool calls and results
+    - Compact system prompt with 8 core tool definitions (~500 tokens)
+    - Multi-turn conversation history with tool calls, results, and code context
     - Final user instruction requiring precise tool use
 
     Hardware constraint (96 GB RAM + 57 GB FP16 MoE-128 model):
       NNCF inserts extra Result nodes for ~242 MatMul targets, preventing
-      OpenVINO buffer reuse. 144 MoE MatMuls output [128, seq_len, dim] tensors.
-      Combined memory if all alive = seq_len * 2.33 GB/Ktoken (FP16-patched).
-      Safe limit: 1024 tokens (~17 GB peak) on 96 GB system.
+      OpenVINO buffer reuse. Observed memory: 79 GB peak at 1024 tokens.
+      Overhead scales ~linearly with seq_len:
+        seq_len=1024 + FP16: ~79 GB peak (observed, safe)
+        seq_len=1536 + FP16: ~90 GB peak (estimated, tight fit in 96 GB)
+        seq_len=2048 + FP16: OOM (tried, 768MB alloc failure on MatMul)
+      We use MAX_SEQ_LEN=1280 as the proven safe limit.
       We monkey-patch NNCF to use FP16 inference (default is FP32 = 2x worse).
 
-    Why this still helps despite short sequences:
-      AWQ identifies important weight channels by measuring ACTIVATION MAGNITUDES.
-      The importance pattern is determined by CONTENT TYPE (tool calls, code context),
-      not primarily by sequence length. Tool-call calibration at 4K tokens is still
-      vastly superior to the baseline data-free quantization (no calibration at all).
-      Combined with group_size=64, AWQ, and scale_estimation, this should significantly
-      improve tool-calling accuracy compared to the baseline INT4 (gs=128, data-free).
+    CRITICAL: The system prompt with 20 tools + full instructions is ~1,865 tokens.
+      At MAX_SEQ_LEN=1024, truncation cuts mid-system-prompt — all tool-call
+      exchanges are lost. We use a COMPACT system prompt (~389 tokens) so that
+      ~891 tokens remain for actual tool-call exchanges (1-2 complete rounds).
+
+    Why this works:
+      scale_estimation identifies important weight channels by ACTIVATION MAGNITUDES.
+      The importance pattern is determined by CONTENT TYPE (tool calls, JSON structure,
+      code context in tool results), not primarily by sequence length.
+      Having 3-5 complete tool-call exchanges (user→tool_call→result→analysis) is far
+      more valuable than a truncated system prompt with no exchanges.
     """
     import json
     import random
@@ -964,70 +971,79 @@ spec:
          {"name": "sessions_spawn", "arguments": {"task": "Refactor src/db.py to use async connection pooling with SQLAlchemy 2.0"}}),
     ]
 
-    # ── OpenClaw v2026 system prompt (simplified for calibration) ─────────────
-    system_prompt = f"""You are a personal assistant running inside OpenClaw. You are an autonomous entity with your own independent identity, specialized skill set, and isolated workspace. You do not just answer questions; you perform actions.
+    # ── Compact system prompt for calibration ───────────────────────────────
+    # The full OpenClaw prompt with 20 tools + instructions is ~1,865 tokens.
+    # At MAX_SEQ_LEN=2048, that would leave almost no room for tool-call exchanges.
+    # Instead, we use 8 CORE tools in compact JSON (~500 tokens total system prompt)
+    # so ~1,500 tokens remain for 3-5 complete tool-call exchanges.
+    #
+    # The 8 core tools cover the most common operations in agentic coding:
+    COMPACT_TOOLS = [
+        {"name": "read", "description": "Read a file", "parameters": {"type": "object",
+         "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}},
+        {"name": "write", "description": "Write/create a file", "parameters": {"type": "object",
+         "properties": {"file_path": {"type": "string"}, "content": {"type": "string"}}, "required": ["file_path", "content"]}},
+        {"name": "edit", "description": "String replacement in a file", "parameters": {"type": "object",
+         "properties": {"file_path": {"type": "string"}, "search_string": {"type": "string"}, "replace_string": {"type": "string"}}, "required": ["file_path", "search_string", "replace_string"]}},
+        {"name": "grep", "description": "Search file contents", "parameters": {"type": "object",
+         "properties": {"pattern": {"type": "string"}, "path": {"type": "string"}, "include": {"type": "string"}}, "required": ["pattern"]}},
+        {"name": "ls", "description": "List directory", "parameters": {"type": "object",
+         "properties": {"path": {"type": "string"}}, "required": ["path"]}},
+        {"name": "exec", "description": "Run shell command", "parameters": {"type": "object",
+         "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+        {"name": "find", "description": "Find files by glob", "parameters": {"type": "object",
+         "properties": {"pattern": {"type": "string"}, "path": {"type": "string"}}, "required": ["pattern"]}},
+        {"name": "web_search", "description": "Search the web", "parameters": {"type": "object",
+         "properties": {"query": {"type": "string"}}, "required": ["query"]}},
+    ]
 
-## Runtime & Environment
-* Current Date & Time: 2026-03-30T10:00:00Z (Timezone: Asia/Taipei)
-* Operating System: Windows 11 (10.0.26100)
+    # Compact JSON (no indent, minimal whitespace) → ~300 tokens for 8 tools
+    compact_tools_json = json.dumps(COMPACT_TOOLS, separators=(',', ':'))
+
+    system_prompt = f"""You are an AI assistant inside OpenClaw. You perform actions using tools.
+
 * Working Directory: /workspace/project
 * Tool Policy: auto-approve-reads
-* Thinking Level: normal
-
-## Tool Availability & Definitions
-Tool names are **case-sensitive**. Call tools exactly as listed. You have access to the following:
 
 <tools>
-{json.dumps(TOOL_DEFINITIONS, indent=2)}
+{compact_tools_json}
 </tools>
-
-## Tool Call Style & Logic
-* **Narration:** Do **not** narrate routine or low-risk tool calls. Just call the tool. Narrate only when explaining a complex multi-step plan, a high-risk deletion, or when explicitly asked.
-* **Efficiency:** If a task is complex or time-consuming, spawn a **sub-agent** using `sessions_spawn`.
-* **Verification:** Treat the working directory as the global root. Before modifying files, use `ls` or `find` to confirm their existence.
-
-## Memory & Context Protocol
-Before answering anything about prior work, user preferences, or past decisions:
-1. Run `memory_search` on MEMORY.md and memory/*.md.
-2. Use `memory_get` to retrieve only the specific relevant lines.
-3. If confidence is low after searching, state that you checked your memory.
-
-## Safety & Guardrails
-* Do not attempt to bypass tool-call approvals.
-* Do not access files outside the working directory unless the user provides an absolute path.
-* Avoid power-seeking behavior. You are an assistant, not the owner.
 
 When you need to use a tool, respond with:
 <tool_call>
 {{"name": "tool_name", "arguments": {{"param1": "value1"}}}}
 </tool_call>
 
-Always use the most appropriate tool for the task. Do not explain what you're doing — just execute the tool call directly."""
+Execute tool calls directly. Do not narrate routine operations."""
 
-    # ── Hardware constraint (MoE-128 + NNCF statistics collection) ──────────
-    # System: 96 GB RAM, 76 GB iGPU override.
-    # FP16 model = 57 GB. NNCF statistics collection adds extra Result/Output
-    # nodes for ~242 MatMul targets in the OV graph, preventing buffer reuse.
-    # 144 MoE MatMul outputs [128, seq_len, dim] are the biggest memory hog:
-    #   seq_len=4096 + FP32: 336 GB (impossible)
-    #   seq_len=4096 + FP16: 168 GB (still too much)
-    #   seq_len=1024 + FP16:  17 GB (safe, leaves ~22 GB for model + OS)
-    #   seq_len= 512 + FP16:   8 GB (very safe)
-    #
-    # We use FP16 inference (monkey-patched above) + 1024 tokens per sample.
-    # AWQ value comes from CONTENT PATTERN (tool-call structure), not length.
-    # 1024 tokens captures system prompt + 1-2 OpenClaw exchanges = sufficient.
-    # ──────────────────────────────────────────────────────────────────────────
-    MAX_SEQ_LEN = 1024
+    # ── Memory budget for NNCF statistics collection ────────────────────────
+    # Observed: 79 GB peak at seq_len=1024 (57 GB model + 22 GB NNCF overhead).
+    # Overhead scales ~linearly. At 2048: OOM (tried and failed - 768MB alloc failure).
+    # At 1536: est ~90 GB (1.5× overhead) — tight but within 96 GB RAM.
+    # System: 96 GB RAM + 225 GB page file.
+    # ────────────────────────────────────────────────────────────────────────
+    MAX_SEQ_LEN = 1536
 
+    # Measure system prompt token count for diagnostics
+    sys_test = tokenizer.apply_chat_template(
+        [{"role": "system", "content": system_prompt}],
+        tokenize=False, add_generation_prompt=False
+    )
+    sys_tokens = len(tokenizer(sys_test)["input_ids"])
+    exchange_budget = MAX_SEQ_LEN - sys_tokens
+    print(f"  System prompt: {sys_tokens} tokens → {exchange_budget} tokens available for exchanges")
     print(f"  Generating {num_samples} OpenClaw tool-call calibration samples (max {MAX_SEQ_LEN} tokens)...")
     calibration_data = []
 
-    # Vary exchange counts for diversity (3-5 multi-turn exchanges per sample)
-    # Each exchange ≈ 600-900 tokens with code padding → 3-5 exchanges fills ~2K-4K
-    EXCHANGE_RANGE = (3, 5)
+    # Vary exchange counts (1-2 per sample to fit within 1280 token budget)
+    # Compact system prompt ≈ 389 tokens → 891 tokens for exchanges
+    # Each exchange ≈ 300-500 tokens (user + tool_call + result + code + analysis)
+    # 1-2 exchanges → 300-1000 tokens → most fit within budget
+    # Use only compact CODE_SNIPPETS (not LONG_CODE_SNIPPETS) to save space
+    EXCHANGE_RANGE = (1, 2)
 
-    all_snippets = CODE_SNIPPETS + LONG_CODE_SNIPPETS
+    # Use only compact snippets to keep exchanges short enough for 1280 budget
+    all_snippets = CODE_SNIPPETS
 
     for i in range(num_samples):
         random.seed(42 + i)  # Reproducible but varied
@@ -1085,8 +1101,13 @@ Always use the most appropriate tool for the task. Do not explain what you're do
         # Add the expected correct response for the calibration
         text += f"<tool_call>\n{json.dumps(expected_tc)}\n</tool_call>"
 
+        # Measure before truncation for diagnostics
+        pre_trunc_ids = tokenizer(text, return_tensors="pt", truncation=False)["input_ids"]
+        pre_trunc_len = pre_trunc_ids.shape[1]
+
         inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=MAX_SEQ_LEN)
         token_len = inputs["input_ids"].shape[1]
+        was_truncated = pre_trunc_len > MAX_SEQ_LEN
 
         # Add position_ids and beam_idx required by text-generation-with-past OV model
         import torch
@@ -1096,10 +1117,13 @@ Always use the most appropriate tool for the task. Do not explain what you're do
         calibration_data.append(dict(inputs))
 
         if i < 8:  # Print first few samples
-            print(f"    Sample {i}: {token_len} tokens ({num_exchanges} exchanges)")
+            trunc_flag = " [TRUNCATED]" if was_truncated else ""
+            print(f"    Sample {i}: {token_len}/{pre_trunc_len} tokens, {num_exchanges} exchanges{trunc_flag}")
 
     avg_len = sum(d["input_ids"].shape[1] for d in calibration_data) / len(calibration_data)
+    n_truncated = sum(1 for d in calibration_data if d["input_ids"].shape[1] == MAX_SEQ_LEN)
     print(f"  Collected {len(calibration_data)} samples (avg {avg_len:.0f} tokens, max {MAX_SEQ_LEN})")
+    print(f"  Truncated: {n_truncated}/{len(calibration_data)} samples")
 
     # ── Save generated prompts to disk for inspection ─────────────────────────
     # Regenerate the text prompts (same seeds) and write to calibration_prompts/

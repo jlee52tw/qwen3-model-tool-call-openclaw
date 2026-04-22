@@ -17,7 +17,7 @@ When using the INT4-quantized Qwen3-Coder-30B-A3B as an agentic coding assistant
 | Quantization | INT4_ASYM, group_size=128, data-free (no AWQ, no calibration dataset) |
 | Model Size | 15.19 GB |
 
-**Hardware:** Intel Core Ultra (integrated GPU), Windows, 32 GB RAM, iGPU memory override 27.5 GB
+**Hardware:** Intel Core Ultra (integrated GPU), Windows, 96 GB RAM, iGPU memory override 76 GB
 
 ## Benchmark Design
 
@@ -30,12 +30,15 @@ Three test suites measure different aspects of long-context intelligence:
 | **Tool-Call (Hard)** | 5 test cases, 12 tool definitions, realistic agentic conversation history with prior tool call/result turns | 0-5 per case |
 
 Context lengths: 4K, 8K, 16K, 24K, 32K tokens (quick mode) or 4K–32K in 4K steps (full mode).
+Extended lengths: 32K, 48K, 64K tokens for stress testing.
 
-The **hard** test is the most representative — it simulates a real coding agent conversation with interleaved tool calls and results, then asks the model to use a specific tool with specific arguments.
+The **hard** test is the most representative — it simulates a real coding agent conversation with interleaved tool calls and results (12 tool definitions, ~190 prior tool call/result turns at 32K), then asks the model to use a specific tool with specific arguments at the very end of the prompt.
 
 ## Results
 
-### Baseline INT4
+### Baseline INT4 (gs=128, ratio=1.0, data-free)
+
+#### Quick Mode (4K–32K)
 
 | Test | 4K | 8K | 16K | 24K | 32K |
 |---|---|---|---|---|---|
@@ -43,10 +46,32 @@ The **hard** test is the most representative — it simulates a real coding agen
 | Tool-Call (Easy) | 5.0/5 | 5.0/5 | 5.0/5 | 5.0/5 | 5.0/5 |
 | **Tool-Call (Hard)** | **4.8/5** | **4.8/5** | **5.0/5** | **4.0/5** | **4.2/5** |
 
+#### Extended Stress Test (32K–64K, 2026-04-02)
+
+| Test | 32K | 48K | 64K |
+|---|---|---|---|
+| Tool-Call (Easy, 7 tools) | **5.0/5** | **5.0/5** | **5.0/5** |
+| **Tool-Call (Hard, 12 tools)** | **4.0/5** | **4.2/5** | **4.0/5** |
+
+Hard tool-call failure details at extended lengths:
+
+| Context | `read_file` | `search_code` | `get_diagnostics` | `replace_in_file` | `run_command` |
+|---|---|---|---|---|---|
+| 32K | **FAIL (1/5)** — 70s | PERFECT | PERFECT | PARTIAL (4/5) | PERFECT |
+| 48K | **FAIL (1/5)** — 155s | PERFECT | PERFECT | PERFECT | PERFECT |
+| 64K | **FAIL (0/5)** — 218s | PERFECT | PERFECT | PERFECT | PERFECT |
+
+**Failure mode:** The model refuses to use the `read_file` tool because it has seen ~95 prior `read_file` calls to the same file (`handlers.py`) in the agentic conversation history. Instead of executing the requested tool call, it generates a long narrative:
+> *"I've reviewed the project structure and codebase multiple times, but I haven't found any actual bugs in the code..."*
+
+The extremely long elapsed times (70–218s vs ~2-4s for passing tests) confirm the model is generating hundreds of tokens of explanation rather than a concise tool call.
+
 Key observations:
-- NIAH and easy tool-call are **perfect** — the model handles basic recall and simple tool use flawlessly
+- NIAH and easy tool-call are **perfect through 64K** — the model handles basic recall and simple tool use flawlessly even at very long contexts
 - Hard tool-call **degrades at 24K+**: model narrates code analysis instead of executing tool calls
-- `replace_in_file` test: model consistently chooses `read_file` instead (read-before-modify strategy, all contexts)
+- The `read_file` failure is **consistent and worsening** — score drops from 1/5 at 32K to 0/5 at 64K
+- `replace_in_file` test: model sometimes chooses `read_file` instead (read-before-modify strategy)
+- Other tools (`search_code`, `get_diagnostics`, `run_command`) remain **perfect through 64K**
 
 ### Experiment 1: Router Dequantization (INT4-RouterFP16)
 
@@ -57,53 +82,84 @@ Key observations:
 | Test | INT4 Baseline | INT4-RouterFP16 |
 |---|---|---|
 | NIAH (4K-32K) | 100% | 100% |
-| Easy tool-call | 5.0/5 all | 5.0/5 all |
+| Easy tool-call (4K-32K) | 5.0/5 all | 5.0/5 all |
 | Hard 16K | **5.0/5** | 4.8/5 |
 | Hard 24K | 4.0/5 | 4.0/5 |
 | Hard 32K | 4.2/5 | 4.2/5 |
 
 **Conclusion:** Router quantization is **NOT** the bottleneck. The degradation comes from attention layer (q/k/v/o_proj) INT4 quantization affecting the model's ability to prioritize recent instructions over extensive conversation history.
 
-### Experiment 2: High-Quality Re-Conversion (Next)
+### Experiment 2: GPU Compatibility Matrix (2026-04-01)
 
-**Hypothesis:** Data-aware INT4 with AWQ + scale_estimation + smaller group_size + long-context calibration data will preserve attention precision better.
+Systematically tested all feasible INT4 parameter combinations on the Intel Arc B390 iGPU:
 
-**Key insight from research:** Standard calibration uses short text samples (~2K tokens). But our degradation happens at 24K+. For AWQ to protect the attention weights (q/k/v/o_proj) that matter at long contexts, it must observe activations at those lengths during calibration.
-
-**Conversion plan — two variants to test:**
-
-| Variant | Method | Calibration | Key Difference |
+| Configuration | GPU Status | Model Size | Notes |
 |---|---|---|---|
-| **INT4-HQ-T3** | Tier 3 (optimum-cli) | wikitext2, 128 samples | AWQ + scale_estimation + gs=64, no router protection |
-| **INT4-HQ** | Tier 1 (NNCF API) | `long_tool_calling`, 32 samples @ 20K+ tokens | AWQ + gs=64 + router protection + long-context agentic calibration |
+| gs=128, ratio=1.0 (baseline) | **OK** | 15.22 GB | All weights INT4 (384 constants) |
+| gs=128, ratio=1.0, RouterFP16 | **OK** | 15.25 GB | 48 routers FP16, rest INT4 |
+| gs=128, ratio=0.9 | **CRASH** (segfault) | — | Mixed INT4+INT8 unsupported |
+| gs=128, ratio=0.8 | **CRASH** (segfault) | 17.94 GB | 105 INT4, 137 INT8, 48 BF16 |
+| gs=64, ratio=1.0 | **CRASH** (segfault) | — | GPU lacks gs=64 decompression kernels |
+| gs=64, ratio=0.8 | **CRASH** (segfault) | — | Both gs=64 and mixed precision fail |
 
-**Parameters (both):**
-- AWQ (Activation-aware Weight Quantization) — calibrates quantization ranges using real data
-- Scale estimation — optimizes per-channel scales
-- Group size 64 (vs baseline 128) — 2× finer granularity
-- Sensitivity metric — `max_activation_variance` (protects most-sensitive layers)
+**Key constraint:** The Intel Arc B390 GPU plugin only supports **uniform INT4 gs=128 (ratio=1.0)**. Any ratio < 1.0 introduces INT8 weight constants that crash during `compile_model()`. All crashed configs work fine on CPU.
 
-**Tier 1 extras:**
-- Router protection via `ignored_scope` (keeps `mlp.gate` at INT8/FP16)
-- Long-context agentic calibration: 20K+ token samples with 12 tool definitions, multi-turn tool call/result conversation history — forces AWQ to observe and protect attention patterns at the exact context lengths where degradation occurs
-- Alternative sensitivity metrics available: `hessian_input_activation`, `mean_activation_magnitude`
+### Experiment 3: NNCF Calibration Memory Limits (2026-03-31)
 
-**Status:** HF model downloaded (56.87 GB), ready for conversion.
+Tested NNCF `compress_weights()` with tool-calling calibration data at various sequence lengths on 96 GB RAM:
 
-### Gemini Analysis Review
-
-We evaluated suggestions from Gemini against our actual model inspection:
-
-| Suggestion | Verdict | Evidence |
+| MAX_SEQ_LEN | Peak RAM | Result |
 |---|---|---|
-| Protect `gate_proj` (MoE router) | **Already tested — no effect** | Router dequant experiment proved this. Also: `gate_proj` is actually the SwiGLU gate in expert MLP, NOT the MoE router (`mlp.gate`). Gemini confused them. |
-| Protect LayerNorm weights | **Unnecessary** | Verified: LayerNorm weights are already FP32 `[1,1,2048]` constants |
-| Protect `embed_tokens`/`lm_head` | **Already done** | Baseline model has these at INT8 |
-| `hessian_trace` metric | **Doesn't exist** | NNCF has `HESSIAN_INPUT_ACTIVATION` (different). We added it as an option. |
-| Group size 64 | **Valid** ✅ | Already in our plan |
-| AWQ + scale_estimation | **Valid** ✅ | Already in our plan |
-| Long-text 20K+ calibration data | **Very valuable** ✅ | **Adopted** — added `long_tool_calling` dataset to `convert_hq.py` |
-| Ratio 0.85 (vs 0.9) | **Worth testing** | Can experiment via `--ratio 0.85` |
+| 1024 tokens | ~79 GB | **OK** (but only truncated system prompts, no tool-call data) |
+| 1280 tokens | ~85 GB est. | **OK** (compact prompt, 0/8 samples truncated) |
+| 1536 tokens | OOM (1.43 GB alloc failure) | **CRASH** on sample 2 at 1469 tokens |
+| 2048 tokens | OOM (768 MB alloc failure) | **CRASH** on first sample |
+
+**Hard limit:** ~1300-1400 tokens per calibration sample with this model on 96 GB RAM.
+
+### HuggingFace INT8 Reference Models
+
+For comparison, the official OpenVINO Hub provides INT8 variants:
+
+| Model | Precision | group_size | Source | Est. Size |
+|---|---|---|---|---|
+| [OpenVINO/Qwen3-30B-A3B-int8-ov](https://huggingface.co/OpenVINO/Qwen3-30B-A3B-int8-ov) | INT8_ASYM | -1 (per-channel) | Qwen3-30B-A3B (base) | ~30 GB |
+| [OpenVINO/Qwen3-30B-A3B-Instruct-2507-int8-ov](https://huggingface.co/OpenVINO/Qwen3-30B-A3B-Instruct-2507-int8-ov) | INT8_ASYM | -1 (per-channel) | Qwen3-30B-A3B-Instruct-2507 | ~30 GB |
+
+INT8 per-channel would give better quality (256 levels vs 16), but at ~30 GB model weight + KV cache for 32K+ context, these would push the 76 GB iGPU limit. Our INT4 at ~15 GB leaves ~60 GB for KV cache.
+
+### Next Steps: NNCF Calibrated Conversion
+
+**Hypothesis:** NNCF `scale_estimation` with tool-calling calibration data will optimize INT4 scales/zero-points for tool-call activation patterns, improving hard tool-call accuracy even at ratio=1.0.
+
+**GPU constraints require:** ratio=1.0 only (no mixed INT4+INT8), gs=128 only (no gs=64).
+
+**Remaining viable optimization levers:**
+- `scale_estimation` — optimizes per-group scales using calibration data (the main quality driver)
+- Tool-calling calibration dataset — compact 8-tool system prompt + multi-turn tool call/result exchanges
+- `max_activation_variance` sensitivity metric — identifies most-sensitive layers
+
+**Planned command:**
+```bash
+python scripts/convert_hq.py --tier tier1 --dataset long_tool_calling \
+  --group-size 128 --ratio 1.0 --subset-size 32 \
+  --sensitivity-metric max_activation_variance \
+  --output-dir "INT4-TOOLCAL"
+```
+
+**Calibration data design:**
+- MAX_SEQ_LEN = 1280 tokens (hard memory limit ~1400)
+- Compact system prompt with 8 core tools (~389 tokens)
+- 1-2 complete tool-call exchanges per sample
+- Pre-truncation diagnostics confirm 0/8 samples truncated
+
+**What was ruled out:**
+- AWQ: crashes with MoE models (`ValueError: matmul shape mismatch` in NNCF 2.19.0)
+- gs=64: GPU crashes on Intel Arc B390
+- ratio < 1.0: GPU crashes (mixed INT4+INT8 unsupported)
+- MAX_SEQ_LEN > 1400: OOM on 96 GB RAM
+
+**Status:** `convert_hq.py` fully updated with compact prompt, AWQ fix, correct defaults. Ready to run.
 
 ## Project Structure
 
@@ -115,12 +171,16 @@ qwen3-model-tool-call-enhancement/
 │   ├── benchmark_context.py     # Long-context benchmark (NIAH + tool-calling)
 │   ├── convert_hq.py            # High-quality INT4 conversion (MoE-optimized)
 │   ├── dequant_routers.py       # Surgical MoE router dequantization (INT4→FP16)
+│   ├── dump_prompts.py          # Dump benchmark prompt contents for inspection
 │   └── llm_code_assistant.py    # Standalone CLI code assistant (baseline app)
-└── benchmarks/
-    ├── benchmark_INT4_*.json         # Baseline INT4 results
-    ├── benchmark_INT4_*.csv
-    ├── benchmark_INT4-RouterFP16_*.json  # RouterFP16 results
-    └── benchmark_INT4-RouterFP16_*.csv
+├── benchmarks/
+│   ├── benchmark_INT4_*.json         # Baseline INT4 results
+│   ├── benchmark_INT4_*.csv
+│   ├── benchmark_INT4-RouterFP16_*.json  # RouterFP16 results
+│   └── benchmark_INT4-RouterFP16_*.csv
+├── prompt_samples/                   # Saved benchmark prompts for inspection
+└── docs/
+    └── 2026-03-30-plan.md            # Work log and plan (Chinese)
 ```
 
 ## Setup
@@ -172,17 +232,14 @@ python scripts/dequant_routers.py --model-dir "...\INT4" --output-dir "...\INT4-
 ### High-Quality Conversion
 
 ```bash
-# Tier 3: optimum-cli with AWQ + gs=64 (uses local HF weights if available)
-python scripts/convert_hq.py --tier tier3
+# NNCF calibrated with tool-calling data (ratio=1.0 required for GPU)
+python scripts/convert_hq.py --tier tier1 --dataset long_tool_calling \
+  --group-size 128 --ratio 1.0 --subset-size 32 \
+  --sensitivity-metric max_activation_variance \
+  --output-dir "INT4-TOOLCAL"
 
-# Tier 3 with explicit local model path
-python scripts/convert_hq.py --tier tier3 --local-model "C:\working\models\...\HF"
-
-# Tier 1: NNCF API with router protection + long-context agentic calibration
-python scripts/convert_hq.py --tier tier1 --dataset long_tool_calling --subset-size 32
-
-# Tier 1 with hessian-based sensitivity metric
-python scripts/convert_hq.py --tier tier1 --dataset long_tool_calling --sensitivity-metric hessian_input_activation
+# Tier 3: optimum-cli data-free (uses local HF weights if available)
+python scripts/convert_hq.py --tier tier3 --group-size 128 --ratio 1.0
 
 # Inspect model precision
 python scripts/convert_hq.py --inspect --model-dir "...\INT4"
@@ -204,14 +261,18 @@ python scripts/llm_code_assistant.py --task audit --device GPU --no-think
 
 ## Key Findings
 
-1. **NIAH and simple tool-calling are unaffected by INT4 quantization** — the model handles these perfectly up to 32K tokens
+1. **NIAH and simple tool-calling are unaffected by INT4 quantization** — the model handles these perfectly up to **64K tokens**
 2. **Hard agentic tool-calling degrades at 24K+** — the model fails to prioritize the latest user instruction when surrounded by extensive conversation history
-3. **MoE router quantization is NOT the cause** — surgically dequantizing all 48 routers to FP16 had zero measurable impact
-4. **Attention layers are the likely bottleneck** — 192 INT4-quantized q/k/v/o_proj layers affect the model's attention patterns at long contexts
-5. **The failure mode is "narration"** — instead of calling the requested tool, the model analyzes and describes the code in the conversation history
-6. **LayerNorm weights are already FP32** — no need to protect them (contradicts some online advice)
-7. **Embedding/lm_head are already INT8** — the default conversion already protects these
-8. **Long-context calibration data is the key missing piece** — standard short-text calibration (wikitext2 @ 2K tokens) cannot teach AWQ about attention patterns at 24K+
+3. **The `read_file` tool is the specific failure** — because the agentic history contains ~95 prior `read_file` calls to the same file, the model thinks it already read it. Score: 1/5 at 32K → 0/5 at 64K
+4. **MoE router quantization is NOT the cause** — surgically dequantizing all 48 routers to FP16 had zero measurable impact
+5. **Attention layers are the likely bottleneck** — 192 INT4-quantized q/k/v/o_proj layers affect the model's attention patterns at long contexts
+6. **The failure mode is "narration"** — instead of calling the requested tool, the model generates hundreds of tokens analyzing the codebase (70-218 seconds vs 2-4 seconds for passing tests)
+7. **Intel Arc B390 GPU only supports uniform INT4 gs=128** — ratio < 1.0 (mixed INT4/INT8) crashes, gs=64 crashes. Only ratio=1.0 works.
+8. **AWQ is broken for MoE models** in NNCF 2.19.0 — `matmul shape mismatch` in awq.py
+9. **NNCF calibration OOMs above ~1400 tokens** on 96 GB RAM with this model
+10. **LayerNorm weights are already FP32** — no need to protect them
+11. **Embedding/lm_head are already INT8** — the default conversion already protects these
+12. **Long-context calibration data is the key missing piece** — standard short-text calibration (wikitext2 @ 2K tokens) cannot teach scale_estimation about attention patterns at 24K+
 
 ## License
 

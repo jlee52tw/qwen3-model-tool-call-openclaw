@@ -22,5 +22,8 @@ Thumbs.db
 # Models (too large for git)
 models/
 
+# NNCF source clone (for investigation only)
+nncf/
+
 # HuggingFace cache
 .cache/
