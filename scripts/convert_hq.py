@@ -238,6 +238,31 @@ def run_tier1(args):
 
     tokenizer = AutoTokenizer.from_pretrained(str(fp16_dir))
 
+    # ── Compute max_seq_len and batching strategy ──
+    use_batched = getattr(args, 'layer_batches', 0) > 0
+    if getattr(args, 'max_seq_len', None):
+        max_seq_len = args.max_seq_len
+    elif use_batched:
+        max_seq_len = MAX_SEQ_LEN_BATCHED
+    else:
+        max_seq_len = MAX_SEQ_LEN_DEFAULT
+
+    # Auto-compute layer batches if --max-seq-len > safe limit but no --layer-batches given
+    # Memory model: peak = 57GB_model + (num_outputs/242) * 22GB * (seq_len/1024)
+    # Safe peak = 85 GB (leave 11 GB headroom in 96 GB RAM)
+    if not use_batched and max_seq_len > MAX_SEQ_LEN_DEFAULT:
+        # Estimate required batches to stay under 85 GB
+        overhead_per_output_per_1k = 22.0 / 242.0  # ~0.091 GB per output per 1K tokens
+        scale = max_seq_len / 1024.0
+        max_safe_outputs = int(28.0 / (overhead_per_output_per_1k * scale))  # 28 GB budget for overhead
+        max_safe_outputs = max(8, min(max_safe_outputs, 242))
+        needed_batches = max(1, (242 + max_safe_outputs - 1) // max_safe_outputs)
+        if needed_batches > 1:
+            print(f"[AUTO] max_seq_len={max_seq_len} requires batching: auto-setting --layer-batches {needed_batches}")
+            print(f"       (max {max_safe_outputs} outputs/batch to stay under 85 GB peak)")
+            args.layer_batches = needed_batches
+            use_batched = True
+
     # Prepare calibration data — use wikitext2 or custom tool-calling prompts
     calibration_data = _prepare_calibration_dataset(
         tokenizer, dataset_name=args.dataset, num_samples=args.subset_size,
@@ -249,8 +274,6 @@ def run_tier1(args):
     print(f"\n{'='*80}")
     print(f"  Step 3: Compressing with NNCF (MoE-optimized)")
     print(f"{'='*80}")
-    use_batched = getattr(args, 'layer_batches', 0) > 0
-    max_seq_len = MAX_SEQ_LEN_BATCHED if use_batched else MAX_SEQ_LEN_DEFAULT
 
     print(f"  Mode:               INT4_ASYM")
     print(f"  Group size:         {args.group_size}")
@@ -1412,6 +1435,10 @@ def main():
     parser.add_argument("--nvme-offload", type=str, default=None,
                         help="Directory on NVMe for intermediate statistics (e.g. D:\\nvme-temp). "
                              "Uses Direct I/O to bypass page cache. If not set, uses output_dir/stats_cache.")
+    parser.add_argument("--max-seq-len", type=int, default=None, dest="max_seq_len",
+                        help="Override max sequence length for calibration data (default: 1536 without "
+                             "batching, 4096 with batching). If set above 1536 without --layer-batches, "
+                             "batching is auto-enabled with computed batch count for memory safety.")
 
     args = parser.parse_args()
 
