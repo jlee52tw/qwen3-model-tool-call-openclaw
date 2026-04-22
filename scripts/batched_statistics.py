@@ -16,10 +16,10 @@ Problem:
   at seq_len=1024. At seq_len>1400, it OOMs on 96 GB RAM.
 
 Solution:
-  Partition the ~242 statistic targets into N batches (default 4, ~60 each).
+  Partition the ~242 statistic targets into N batches (default 3, ~80 each).
   For each batch:
     1. Create a fresh StatisticsAggregator with only that batch's targets
-    2. ``collect_statistics()`` — only ~60 Result nodes → much less memory
+    2. ``collect_statistics()`` — only ~80 Result nodes → much less memory
     3. ``dump_statistics()`` to a temporary directory (NNCF safetensors format)
     4. Free memory (del aggregator, gc.collect)
   After all batches:
@@ -28,7 +28,7 @@ Solution:
 
 Memory impact:
   All 242 outputs → ~79 GB peak @ 1024 tokens
-  60 outputs/batch → ~63 GB peak @ 1024 tokens → supports seq_len ≈ 4096
+  88 outputs/batch → ~65 GB peak @ 1024 tokens → 31 GB free RAM
 
 Usage:
   Called from convert_hq.py's run_tier1() when --layer-batches is specified.
@@ -38,9 +38,9 @@ Usage:
     stats_dir = collect_statistics_batched(
         ov_model=ov_model,
         nncf_dataset=nncf_dataset,
-        subset_size=32,
-        stats_dir="D:/nvme-temp/stats",
-        num_batches=4,
+        subset_size=8,
+        stats_dir="path/to/stats",
+        num_batches=3,
     )
 
     # Then pass to compress_weights via advanced_parameters:
@@ -69,191 +69,185 @@ def collect_statistics_batched(
     nncf_dataset,
     subset_size: int,
     stats_dir: str,
-    num_batches: int = 4,
+    num_batches: int = 3,
     nvme_offload_dir: Optional[str] = None,
 ) -> str:
     """
     Collect NNCF weight compression statistics in layer-batched passes.
 
-    This is a drop-in replacement for NNCF's ``cache_weight_compression_statistics()``
-    that limits the number of simultaneous Result nodes in the transformed model,
-    dramatically reducing peak memory.
+    Drop-in replacement for NNCF's ``cache_weight_compression_statistics()``
+    that limits simultaneous Result nodes per inference pass.
 
     :param ov_model: OpenVINO model (FP16, not yet quantized).
     :param nncf_dataset: NNCF Dataset wrapping calibration data.
     :param subset_size: Number of calibration samples per batch.
     :param stats_dir: Output directory for merged statistics (safetensors).
-    :param num_batches: Number of batches to split targets into (default: 4).
+    :param num_batches: Number of batches to split targets into.
     :param nvme_offload_dir: Optional override for temporary batch storage.
-                             If None, batch temps are stored under stats_dir.
     :return: Path to the merged statistics directory (= stats_dir).
     """
-    from nncf.common.factory import StatisticsAggregatorFactory, build_graph
+    from nncf.common.factory import NNCFGraphFactory, StatisticsAggregatorFactory
     from nncf.openvino.graph.model_utils import remove_friendly_name_duplicates
     from nncf.quantization.algorithms.weight_compression.algorithm import (
         WeightCompression,
         get_weight_compression_configuration,
     )
-    from nncf.quantization.statistics_caching import (
-        register_all_statistics,
-    )
-    from nncf.common.tensor_statistics.statistic_point import StatisticPointsContainer
+    from nncf.quantization.statistics_caching import register_all_statistics
 
     stats_path = Path(stats_dir)
 
     # If stats already exist, skip collection entirely
     if stats_path.exists() and (stats_path / "statistics_metadata.json").exists():
-        print(f"  [BatchedStats] Statistics directory already exists at {stats_dir}, reusing.")
+        print(f"  [BatchedStats] Statistics already exist at {stats_dir}, reusing.")
         return stats_dir
 
-    print(f"\n{'='*80}")
-    print(f"  BATCHED STATISTICS COLLECTION")
-    print(f"{'='*80}")
+    print(f"\n  BATCHED STATISTICS COLLECTION")
+    print(f"  {'─' * 50}")
     print(f"  Batches:     {num_batches}")
     print(f"  Subset size: {subset_size}")
     print(f"  Output:      {stats_dir}")
     print()
 
-    # ── Step 1: Build NNCF graph and get all statistic points ──
+    # ── Step 1: Build NNCF graph and discover all stat points ──
     print("  [Step 1] Analyzing model graph and statistic points...")
     t0 = time.time()
 
     # NNCF requires deduplicated friendly names
-    model_clean = remove_friendly_name_duplicates(ov_model)
-    graph = build_graph(model_clean)
+    model_for_graph = remove_friendly_name_duplicates(ov_model)
+    graph = NNCFGraphFactory.create(model_for_graph)
 
-    # Create compression algorithm with superset config (same as
-    # cache_weight_compression_statistics) to collect ALL possible stats
+    # Create weight compression algo with superset config (same as
+    # cache_weight_compression_statistics) to discover ALL possible stat points
     config = get_weight_compression_configuration(
         awq=True, scale_estimation=True, lora_correction=True
     )
-    compression_algo = WeightCompression(**config, subset_size=subset_size)
-    compression_algo.set_backend_entity(model_clean)
+    master_algo = WeightCompression(**config, subset_size=subset_size)
+    master_algo.set_backend_entity(model_for_graph)
 
-    # Register all statistics (main + mixed precision) on a master aggregator
-    master_aggregator = StatisticsAggregatorFactory.create(model_clean, nncf_dataset)
-    register_all_statistics(
-        master_aggregator, model_clean, graph, subset_size, compression_algo
-    )
+    # Register all stat points on a throwaway aggregator to discover targets
+    discovery_agg = StatisticsAggregatorFactory.create(model_for_graph, nncf_dataset)
+    register_all_statistics(discovery_agg, model_for_graph, graph, subset_size, master_algo)
 
-    all_points = master_aggregator.statistic_points
-    total_targets = len(all_points)
-    total_collectors = sum(
-        1 for _ in all_points.get_tensor_collectors()
-    )
+    # Extract target node names (keys of the StatisticPointsContainer)
+    all_target_keys = list(discovery_agg.statistic_points.keys())
+    total_targets = len(all_target_keys)
 
-    print(f"  Total target nodes:     {total_targets}")
-    print(f"  Total tensor collectors: {total_collectors}")
-    print(f"  Analysis time:          {time.time() - t0:.1f}s")
+    print(f"  Total target nodes: {total_targets}")
+    print(f"  Analysis time:      {time.time() - t0:.1f}s")
 
-    # ── Step 2: Partition targets into batches by layer number ──
-    print(f"\n  [Step 2] Partitioning {total_targets} targets into {num_batches} batches...")
-    batches = _partition_statistic_points(all_points, num_batches)
-
-    for i, batch in enumerate(batches):
-        batch_count = sum(1 for _ in batch.get_tensor_collectors())
-        layer_info = _get_batch_layer_range(batch)
-        print(f"    Batch {i+1}: {len(batch)} target nodes, {batch_count} collectors ({layer_info})")
-
-    # Free the master aggregator's heavyweight objects (keep stat points for reference)
-    del master_aggregator
+    # Free discovery objects (we'll create fresh ones per batch)
+    del discovery_agg, master_algo
     gc.collect()
+
+    # ── Step 2: Partition target keys into batches by layer number ──
+    print(f"\n  [Step 2] Partitioning {total_targets} targets into {num_batches} batches...")
+    key_batches = _partition_keys_by_layer(all_target_keys, num_batches)
+
+    for i, keys in enumerate(key_batches):
+        layer_info = _get_layer_range(keys)
+        print(f"    Batch {i + 1}: {len(keys)} targets ({layer_info})")
 
     # ── Step 3: Collect statistics for each batch ──
     batch_temp_base = Path(nvme_offload_dir) if nvme_offload_dir else stats_path / "_batches"
     batch_dirs = []
     total_start = time.time()
 
-    for i, batch_points in enumerate(batches):
+    for i, batch_keys in enumerate(key_batches):
         batch_dir = batch_temp_base / f"batch_{i}"
         batch_dirs.append(batch_dir)
+        batch_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"\n  [Step 3.{i+1}] Collecting batch {i+1}/{num_batches} "
-              f"({len(batch_points)} targets)...")
+        print(f"\n  [Step 3.{i + 1}] Collecting batch {i + 1}/{num_batches} "
+              f"({len(batch_keys)} targets)...")
 
         t_batch = time.time()
+        batch_key_set = set(batch_keys)
 
-        # Create fresh aggregator + algorithm for this batch
-        # (fresh objects = fresh collectors with no accumulated data)
+        # Create FRESH compression algo and aggregator for each batch
+        # (fresh collectors = no accumulated data from previous batches)
         batch_algo = WeightCompression(**config, subset_size=subset_size)
-        batch_algo.set_backend_entity(model_clean)
+        batch_algo.set_backend_entity(model_for_graph)
 
-        batch_aggregator = StatisticsAggregatorFactory.create(model_clean, nncf_dataset)
+        batch_agg = StatisticsAggregatorFactory.create(model_for_graph, nncf_dataset)
 
-        # Register only this batch's statistic points
-        # We must create FRESH stat points for each batch (not reuse from master)
-        # because collectors accumulate data during collection
-        _register_batch_statistics(
-            batch_aggregator, model_clean, graph, subset_size,
-            batch_algo, batch_points
-        )
+        # Register ALL stat points (same full set)...
+        register_all_statistics(batch_agg, model_for_graph, graph, subset_size, batch_algo)
 
-        # Run forward passes — only this batch's Result nodes are added to the model
-        batch_aggregator.collect_statistics(model_clean, graph)
+        # ...then REMOVE targets not in this batch.
+        # This ensures only this batch's Result nodes get inserted during inference,
+        # dramatically reducing peak memory.
+        keys_to_remove = [k for k in list(batch_agg.statistic_points.keys())
+                          if k not in batch_key_set]
+        for k in keys_to_remove:
+            del batch_agg.statistic_points[k]
 
-        # Dump to safetensors
-        batch_dir.mkdir(parents=True, exist_ok=True)
-        batch_aggregator.dump_statistics(batch_dir)
+        remaining = len(batch_agg.statistic_points)
+        print(f"           Registered {remaining} targets (removed {len(keys_to_remove)})")
+
+        # Run forward passes — only this batch's Result nodes added to model
+        batch_agg.collect_statistics(model_for_graph, graph)
+
+        # Dump batch statistics to safetensors
+        batch_agg.dump_statistics(batch_dir)
 
         elapsed = time.time() - t_batch
-        print(f"           Completed in {elapsed:.0f}s ({elapsed/60:.1f} min)")
+        print(f"           Completed in {elapsed:.0f}s ({elapsed / 60:.1f} min)")
+
+        # Report RAM usage if psutil is available
+        try:
+            import psutil
+            ram = psutil.virtual_memory()
+            print(f"           RAM: {ram.used / (1024 ** 3):.1f} GB used, "
+                  f"{ram.available / (1024 ** 3):.1f} GB free")
+        except ImportError:
+            pass
 
         # Aggressive memory cleanup between batches
-        del batch_aggregator, batch_algo
+        del batch_agg, batch_algo
         gc.collect()
 
     total_elapsed = time.time() - total_start
-    print(f"\n  [Step 3] All batches collected in {total_elapsed:.0f}s ({total_elapsed/60:.1f} min)")
+    print(f"\n  [Step 3] All batches collected in {total_elapsed:.0f}s ({total_elapsed / 60:.1f} min)")
 
     # ── Step 4: Merge batch directories into final stats directory ──
-    print(f"\n  [Step 4] Merging {num_batches} batch directories...")
+    print(f"\n  [Step 4] Merging {len(batch_dirs)} batch directories...")
     _merge_statistics_dirs(batch_dirs, stats_path)
 
     # Clean up batch temp directories
-    if batch_temp_base != stats_path:
-        shutil.rmtree(batch_temp_base, ignore_errors=True)
-    else:
-        # Remove _batches subdir from within stats_path
-        batches_subdir = stats_path / "_batches"
-        if batches_subdir.exists():
-            shutil.rmtree(batches_subdir, ignore_errors=True)
+    batches_subdir = stats_path / "_batches"
+    if batches_subdir.exists():
+        shutil.rmtree(batches_subdir, ignore_errors=True)
+    if nvme_offload_dir and Path(nvme_offload_dir).exists():
+        shutil.rmtree(nvme_offload_dir, ignore_errors=True)
 
     print(f"  Merged statistics saved to: {stats_dir}")
-    print(f"  Total files: {sum(1 for _ in stats_path.iterdir())}")
+    stat_files = list(stats_path.glob("*.safetensors"))
+    print(f"  Total safetensors files: {len(stat_files)}")
 
     return stats_dir
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
 
-def _partition_statistic_points(
-    points,
-    num_batches: int,
-) -> list:
+def _partition_keys_by_layer(keys: list, num_batches: int) -> list:
     """
-    Partition a StatisticPointsContainer into N batches by layer number.
+    Partition target node keys into N batches by layer number.
 
-    The container keys are target node names like:
+    Keys look like:
       ``__module.model.layers.5.self_attn.q_proj/ov_ext::linear/MatMul``
-    We extract the layer number and group sequentially, then split into batches.
-
-    Non-layer nodes (embeddings, lm_head) are included in the first batch.
+    We extract the layer number and group sequentially, then split.
+    Non-layer keys (embeddings, lm_head) go in the first batch.
     """
-    from nncf.common.tensor_statistics.statistic_point import StatisticPointsContainer
-
     layer_pattern = re.compile(r"layers[._](\d+)")
 
-    # Map each key to its layer number
+    # Map each key to its layer number (-1 for non-layer nodes)
     key_layers = {}
-    for key in points.keys():
+    for key in keys:
         match = layer_pattern.search(key)
-        if match:
-            key_layers[key] = int(match.group(1))
-        else:
-            key_layers[key] = -1  # Non-layer nodes (embed, lm_head)
+        key_layers[key] = int(match.group(1)) if match else -1
 
-    # Sort keys by layer number for sequential batching
-    sorted_keys = sorted(points.keys(), key=lambda k: key_layers.get(k, -1))
+    # Sort by layer number for sequential batching
+    sorted_keys = sorted(keys, key=lambda k: key_layers[k])
 
     # Split into approximately equal batches
     batch_size = max(1, len(sorted_keys) // num_batches)
@@ -261,29 +255,21 @@ def _partition_statistic_points(
 
     for i in range(num_batches):
         start = i * batch_size
-        if i == num_batches - 1:
-            # Last batch gets remainder
-            end = len(sorted_keys)
-        else:
-            end = start + batch_size
-
-        batch = StatisticPointsContainer()
-        for key in sorted_keys[start:end]:
-            batch[key] = points[key]
-
-        if batch:  # Don't add empty batches
+        end = len(sorted_keys) if i == num_batches - 1 else start + batch_size
+        batch = sorted_keys[start:end]
+        if batch:
             batches.append(batch)
 
     return batches
 
 
-def _get_batch_layer_range(batch_points) -> str:
-    """Get human-readable layer range string for a batch."""
+def _get_layer_range(keys: list) -> str:
+    """Get human-readable layer range string for a batch of keys."""
     layer_pattern = re.compile(r"layers[._](\d+)")
     layers = set()
     non_layer = 0
 
-    for key in batch_points.keys():
+    for key in keys:
         match = layer_pattern.search(key)
         if match:
             layers.add(int(match.group(1)))
@@ -299,62 +285,15 @@ def _get_batch_layer_range(batch_points) -> str:
     return ", ".join(parts) if parts else "empty"
 
 
-def _register_batch_statistics(
-    aggregator,
-    model,
-    graph,
-    subset_size: int,
-    compression_algo,
-    batch_points,
-):
-    """
-    Register statistic points for a specific batch.
-
-    Instead of registering ALL stat points (which would create too many Result
-    nodes during collection), we only register the points whose target node
-    names match this batch's keys.
-
-    We replicate the full statistics registration (main + mixed precision)
-    but filter to only keep targets in this batch.
-    """
-    from nncf.quantization.statistics_caching import register_all_statistics
-    from nncf.common.tensor_statistics.statistic_point import StatisticPointsContainer
-
-    # Register ALL stat points on a temporary aggregator
-    temp_aggregator_points = StatisticPointsContainer()
-
-    # Get the batch's target node names
-    batch_keys = set(batch_points.keys())
-
-    # Create a fresh superset of all stat points
-    from nncf.common.factory import StatisticsAggregatorFactory
-    temp_agg = StatisticsAggregatorFactory.create(model, aggregator.dataset)
-    register_all_statistics(temp_agg, model, graph, subset_size, compression_algo)
-
-    # Filter to only this batch's target nodes
-    for key, stat_point_list in temp_agg.statistic_points.items():
-        if key in batch_keys:
-            temp_aggregator_points[key] = stat_point_list
-
-    # Register the filtered points on the actual aggregator
-    aggregator.register_statistic_points(temp_aggregator_points)
-
-    # Clean up
-    del temp_agg
-    gc.collect()
-
-
 def _merge_statistics_dirs(batch_dirs: list, output_dir: Path) -> None:
     """
     Merge multiple NNCF batch statistics directories into one.
 
     Each batch directory contains:
-      - statistics_metadata.json with {"mapping": {sanitized: original}, ...}
+      - statistics_metadata.json with {"mapping": {sanitized_name: original_name}}
       - Individual .safetensors files
 
-    We combine all safetensors files and merge the metadata mappings.
-    Since batches are disjoint by target node, there should be no filename
-    conflicts.
+    Batches are disjoint by target node, so no filename conflicts expected.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -364,9 +303,8 @@ def _merge_statistics_dirs(batch_dirs: list, output_dir: Path) -> None:
     for batch_dir in batch_dirs:
         metadata_path = batch_dir / "statistics_metadata.json"
         if not metadata_path.exists():
-            raise FileNotFoundError(
-                f"Missing statistics_metadata.json in batch directory: {batch_dir}"
-            )
+            print(f"  [WARN] No statistics_metadata.json in {batch_dir}, skipping")
+            continue
 
         with open(metadata_path, "r") as f:
             metadata = json.load(f)
@@ -377,27 +315,28 @@ def _merge_statistics_dirs(batch_dirs: list, output_dir: Path) -> None:
 
         # Copy safetensors files and accumulate mapping
         for saved_name, original_name in metadata.get("mapping", {}).items():
-            # safetensors files might be saved_name.safetensors or just saved_name
-            src_with_ext = batch_dir / f"{saved_name}.safetensors"
-            src_without_ext = batch_dir / saved_name
+            # Find the source file (try common naming patterns)
+            candidates = [
+                batch_dir / f"{saved_name}.safetensors",
+                batch_dir / saved_name,
+            ]
 
-            if src_with_ext.exists():
-                src = src_with_ext
-                dst = output_dir / f"{saved_name}.safetensors"
-            elif src_without_ext.exists():
-                src = src_without_ext
-                dst = output_dir / saved_name
-            else:
-                # Try glob matching
+            src = None
+            for candidate in candidates:
+                if candidate.exists():
+                    src = candidate
+                    break
+
+            if src is None:
                 matches = list(batch_dir.glob(f"{saved_name}*"))
                 if matches:
                     src = matches[0]
-                    dst = output_dir / src.name
-                else:
-                    print(f"  [WARN] Missing statistics file for {saved_name} in {batch_dir}")
-                    continue
 
-            # Check for conflicts (shouldn't happen with disjoint batches)
+            if src is None:
+                print(f"  [WARN] Missing statistics file for {saved_name} in {batch_dir}")
+                continue
+
+            dst = output_dir / src.name
             if saved_name in merged_mapping:
                 print(f"  [WARN] Duplicate stat key {saved_name}, overwriting")
 
@@ -416,4 +355,4 @@ def _merge_statistics_dirs(batch_dirs: list, output_dir: Path) -> None:
 
 if __name__ == "__main__":
     print("batched_statistics.py — no standalone tests (requires NNCF + OV model)")
-    print("Use via convert_hq.py --tier tier1 --layer-batches 4")
+    print("Use via convert_hq.py --tier tier1 --layer-batches N")

@@ -247,21 +247,26 @@ def run_tier1(args):
     else:
         max_seq_len = MAX_SEQ_LEN_DEFAULT
 
-    # Auto-compute layer batches if --max-seq-len > safe limit but no --layer-batches given
-    # Memory model: peak = 57GB_model + (num_outputs/242) * 22GB * (seq_len/1024)
-    # Safe peak = 85 GB (leave 11 GB headroom in 96 GB RAM)
-    if not use_batched and max_seq_len > MAX_SEQ_LEN_DEFAULT:
-        # Estimate required batches to stay under 85 GB
+    # Auto-compute layer batches to keep peak memory under 65 GB.
+    # The FP16 model alone is ~57 GB. Without batching, NNCF adds ~242 extra
+    # Result nodes: peak = 57 + (242/242)*22*(seq_len/1024) ≈ 79 GB @ 1K tokens.
+    # That leaves only ~17 GB free on 96 GB RAM → heavy page-file thrashing.
+    # With batching (4 batches of ~60 outputs): peak ≈ 57 + 5.5 = 63 GB → 33 GB free.
+    # Always batch to avoid paging, regardless of sequence length.
+    if not use_batched:
         overhead_per_output_per_1k = 22.0 / 242.0  # ~0.091 GB per output per 1K tokens
         scale = max_seq_len / 1024.0
-        max_safe_outputs = int(28.0 / (overhead_per_output_per_1k * scale))  # 28 GB budget for overhead
+        # Target: keep output overhead under 8 GB (peak ~65 GB, leaving ~31 GB free)
+        max_safe_outputs = int(8.0 / (overhead_per_output_per_1k * scale))
         max_safe_outputs = max(8, min(max_safe_outputs, 242))
         needed_batches = max(1, (242 + max_safe_outputs - 1) // max_safe_outputs)
         if needed_batches > 1:
-            print(f"[AUTO] max_seq_len={max_seq_len} requires batching: auto-setting --layer-batches {needed_batches}")
-            print(f"       (max {max_safe_outputs} outputs/batch to stay under 85 GB peak)")
+            print(f"[AUTO] Always-batch mode: {needed_batches} batches "
+                  f"(max {max_safe_outputs} outputs/batch → ~{57 + max_safe_outputs * overhead_per_output_per_1k * scale:.0f} GB peak)")
             args.layer_batches = needed_batches
             use_batched = True
+        else:
+            print(f"[INFO] seq_len={max_seq_len}: all 242 outputs fit in 8 GB overhead budget")
 
     # Prepare calibration data — use wikitext2 or custom tool-calling prompts
     calibration_data = _prepare_calibration_dataset(
