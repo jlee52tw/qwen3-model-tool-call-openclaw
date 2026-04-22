@@ -306,6 +306,67 @@ def run_tier1(args):
     _nncf_engine.OVNativeEngine.__init__ = _patched_engine_init
     print("  [PATCH] NNCF inference precision: FP16 (reduced from FP32 for MoE memory)")
 
+    # ── Monkey-patch NNCF scale_estimation to handle 3D MoE expert weights ──
+    # NNCF bug: For MoE expert weights shaped [num_experts, out, in], the
+    # activation statistics are reduced to 1D [in_features], but scale_estimation
+    # expects stats matching the 3D weight dimensions. When reduction_axis=2 and
+    # s is only 2D after unsqueeze, s.shape[2] triggers IndexError.
+    # Fix: Catch IndexError per-layer and skip scale estimation for 3D expert
+    # weights, falling back to default quantization. The critical 2D attention
+    # projections (q/k/v/o_proj) still get full scale estimation.
+    from nncf.quantization.algorithms.weight_compression import scale_estimation as _se_mod
+    CompressedWeight = _se_mod.CompressedWeight
+    _orig_se_apply = _se_mod.ScaleEstimation.apply
+
+    def _patched_se_apply(self, model, graph, all_weight_params, statistics, backend_entity=None):
+        from nncf.common.logging.track_progress import track
+        self._backend_entity = backend_entity
+        if self._backend_entity is None:
+            self._set_backend_entity(model)
+        res = dict()
+        skipped_3d = 0
+
+        for wp in track(all_weight_params, description="Applying Scale Estimation"):
+            weight_name = wp.weight_name
+            node_name = wp.node_with_weight.node_name
+            config = wp.compression_config
+
+            if config.num_bits != 4 or node_name not in statistics:
+                res[weight_name] = CompressedWeight()
+                continue
+
+            stats = statistics[node_name]
+            weight_data = self._backend_entity.get_weight_names_and_port_ids(wp.node_with_weight, graph)
+            if len(weight_data) != 1:
+                continue
+            _, weight_port_id = weight_data[0]
+
+            if self._backend_entity.matmul_has_transposed_activations(wp.node_with_weight, graph):
+                import nncf as _nncf_err
+                raise _nncf_err.UnsupportedModelError(
+                    "Transposed activations not supported for Scale Estimation")
+
+            weight = self._backend_entity.get_weight(wp.node_with_weight, weight_port_id, model, graph)
+
+            try:
+                scale, zero_point = _se_mod.ScaleEstimation.calculate_quantization_params(
+                    stats, weight, wp.reduction_axes, config,
+                    self._subset_size, self._initial_steps, self._scale_steps, self._weight_penalty,
+                )
+                res[weight_name] = CompressedWeight(None, scale, zero_point, None)
+            except IndexError:
+                # 3D MoE expert weight: stats dimension mismatch, skip scale estimation
+                res[weight_name] = CompressedWeight()
+                skipped_3d += 1
+
+        if skipped_3d:
+            print(f"  [PATCH] Skipped scale estimation for {skipped_3d} 3D MoE expert weights "
+                  f"(IndexError: stats dimension mismatch). Using default quantization for those layers.")
+        return res
+
+    _se_mod.ScaleEstimation.apply = _patched_se_apply
+    print("  [PATCH] Scale estimation: skip 3D MoE expert weights (NNCF IndexError workaround)")
+
     core = ov.Core()
     ov_model = core.read_model(str(fp16_dir / "openvino_model.xml"))
 
@@ -1403,8 +1464,8 @@ def main():
                         help="Override output directory")
     parser.add_argument("--group-size", type=int, default=128,
                         help="Quantization group size (default: 128, only gs=128 works on Arc B390 GPU)")
-    parser.add_argument("--ratio", type=float, default=0.8,
-                        help="INT4 vs INT8 ratio (default: 0.8, lower = more INT8 for sensitive layers)")
+    parser.add_argument("--ratio", type=float, default=1.0,
+                        help="INT4 vs INT8 ratio (default: 1.0; ratio<1.0 crashes on Arc B390 GPU)")
     parser.add_argument("--dataset", type=str, default="wikitext2",
                         choices=["wikitext2", "tool_calling", "long_tool_calling"],
                         help="Calibration dataset (default: wikitext2)")
