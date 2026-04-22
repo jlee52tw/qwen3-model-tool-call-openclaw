@@ -21,6 +21,8 @@ Usage:
     python convert_hq.py --tier tier3
     python convert_hq.py --tier tier3 --local-model "C:\\...\\HF"  # use local weights
     python convert_hq.py --tier tier1 --subset-size 64 --dataset long_tool_calling
+    python convert_hq.py --tier tier1 --layer-batches 4 --dataset long_tool_calling
+    python convert_hq.py --tier tier1 --layer-batches 4 --nvme-offload D:\\nvme-temp
     python convert_hq.py --inspect             # inspect existing model layers
     python convert_hq.py --inspect --model-dir "C:\\working\\models\\...\\INT4-HQ"
 """
@@ -50,6 +52,14 @@ LOCAL_HF_DIR = BASE_MODEL_DIR / "HF"
 # Node naming in OV IR: self.model.layers.{N}.mlp.gate.weight
 # MatMul naming: __module.model.layers.{N}.mlp.gate/ov_ext::linear/MatMul
 MOE_ROUTER_PATTERN = r".*mlp\.gate.*"
+
+# MAX_SEQ_LEN for calibration data truncation.
+# Without batching: NNCF inserts ~242 Result nodes simultaneously → 79 GB peak
+# at 1024 tokens. OOM above ~1400 tokens on 96 GB RAM. Safe limit = 1536.
+# With layer-batched collection (4 batches of ~60 outputs): peak drops to ~63 GB
+# at 1024 tokens, allowing seq_len up to ~4096 tokens.
+MAX_SEQ_LEN_DEFAULT = 1536
+MAX_SEQ_LEN_BATCHED = 4096
 
 
 # ── Tier 3: optimum-cli (no router protection, but AWQ + gs=64) ───────────────
@@ -230,7 +240,8 @@ def run_tier1(args):
 
     # Prepare calibration data — use wikitext2 or custom tool-calling prompts
     calibration_data = _prepare_calibration_dataset(
-        tokenizer, dataset_name=args.dataset, num_samples=args.subset_size
+        tokenizer, dataset_name=args.dataset, num_samples=args.subset_size,
+        max_seq_len=max_seq_len,
     )
     nncf_dataset = Dataset(calibration_data)
 
@@ -238,6 +249,9 @@ def run_tier1(args):
     print(f"\n{'='*80}")
     print(f"  Step 3: Compressing with NNCF (MoE-optimized)")
     print(f"{'='*80}")
+    use_batched = getattr(args, 'layer_batches', 0) > 0
+    max_seq_len = MAX_SEQ_LEN_BATCHED if use_batched else MAX_SEQ_LEN_DEFAULT
+
     print(f"  Mode:               INT4_ASYM")
     print(f"  Group size:         {args.group_size}")
     print(f"  Ratio:              {args.ratio}")
@@ -248,6 +262,12 @@ def run_tier1(args):
     print(f"  Backup mode:        {args.backup_precision or 'INT8_ASYM'}")
     print(f"  Subset size:        {args.subset_size}")
     print(f"  All layers:         False (embeddings/lm_head → INT8)")
+    if use_batched:
+        print(f"  Layer batches:      {args.layer_batches} (NVMe-offloaded statistics)")
+        print(f"  NVMe offload:       {getattr(args, 'nvme_offload', None) or 'default (output_dir/stats_cache)'}")
+        print(f"  Max seq length:     {max_seq_len} (raised from {MAX_SEQ_LEN_DEFAULT} via batching)")
+    else:
+        print(f"  Max seq length:     {max_seq_len}")
     print()
 
     # ── Monkey-patch NNCF to use FP16 inference for statistics collection ──
@@ -284,6 +304,34 @@ def run_tier1(args):
     sensitivity = metric_map.get(args.sensitivity_metric, SensitivityMetric.MAX_ACTIVATION_VARIANCE)
 
     start = time.time()
+
+    # Determine if we use batched statistics collection
+    advanced_params = None
+    if use_batched:
+        from batched_statistics import collect_statistics_batched
+        from nncf.quantization.advanced_parameters import AdvancedCompressionParameters
+
+        stats_dir = getattr(args, 'nvme_offload', None) or str(output_path / "stats_cache")
+
+        print(f"\n{'='*80}")
+        print(f"  Step 3a: Batched Statistics Collection")
+        print(f"{'='*80}")
+
+        collect_statistics_batched(
+            ov_model=ov_model,
+            nncf_dataset=nncf_dataset,
+            subset_size=args.subset_size,
+            stats_dir=stats_dir,
+            num_batches=args.layer_batches,
+            nvme_offload_dir=getattr(args, 'nvme_offload', None),
+        )
+
+        advanced_params = AdvancedCompressionParameters(statistics_path=stats_dir)
+
+        print(f"\n{'='*80}")
+        print(f"  Step 3b: Applying Compression (using pre-collected statistics)")
+        print(f"{'='*80}\n")
+
     compressed_model = compress_weights(
         ov_model,
         mode=CompressWeightsMode.INT4_ASYM,
@@ -299,6 +347,7 @@ def run_tier1(args):
         lora_correction=False,
         backup_mode=backup,
         all_layers=False,  # Keep embeddings/lm_head at backup precision
+        advanced_parameters=advanced_params,
     )
     compress_time = time.time() - start
     print(f"\n[INFO] NNCF compression completed in {compress_time:.0f}s ({compress_time/60:.1f} min)")
@@ -332,7 +381,7 @@ def run_tier1(args):
     _inspect_model(str(output_path / "openvino_model.xml"), filter_pattern="mlp.gate")
 
 
-def _prepare_calibration_dataset(tokenizer, dataset_name="wikitext2", num_samples=128):
+def _prepare_calibration_dataset(tokenizer, dataset_name="wikitext2", num_samples=128, max_seq_len=None):
     """Prepare calibration dataset for NNCF data-aware compression."""
 
     if dataset_name == "tool_calling":
@@ -340,7 +389,7 @@ def _prepare_calibration_dataset(tokenizer, dataset_name="wikitext2", num_sample
         return _prepare_tool_calling_dataset(tokenizer, num_samples)
     elif dataset_name == "long_tool_calling":
         # Long-context agentic calibration data (~20K+ tokens per sample)
-        return _prepare_long_tool_calling_dataset(tokenizer, num_samples)
+        return _prepare_long_tool_calling_dataset(tokenizer, num_samples, max_seq_len=max_seq_len)
 
     # Default: use wikitext2 via HuggingFace datasets
     from datasets import load_dataset
@@ -444,7 +493,7 @@ When you need to use a tool, respond with:
     return calibration_data
 
 
-def _prepare_long_tool_calling_dataset(tokenizer, num_samples=32):
+def _prepare_long_tool_calling_dataset(tokenizer, num_samples=32, max_seq_len=None):
     """
     Create OpenClaw v2026 tool-calling calibration samples for scale_estimation.
 
@@ -454,19 +503,16 @@ def _prepare_long_tool_calling_dataset(tokenizer, num_samples=32):
     - Final user instruction requiring precise tool use
 
     Hardware constraint (96 GB RAM + 57 GB FP16 MoE-128 model):
-      NNCF inserts extra Result nodes for ~242 MatMul targets, preventing
-      OpenVINO buffer reuse. Observed memory: 79 GB peak at 1024 tokens.
-      Overhead scales ~linearly with seq_len:
-        seq_len=1024 + FP16: ~79 GB peak (observed, safe)
-        seq_len=1536 + FP16: ~90 GB peak (estimated, tight fit in 96 GB)
-        seq_len=2048 + FP16: OOM (tried, 768MB alloc failure on MatMul)
-      We use MAX_SEQ_LEN=1280 as the proven safe limit.
-      We monkey-patch NNCF to use FP16 inference (default is FP32 = 2x worse).
+      Without batching: NNCF inserts ~242 Result nodes simultaneously.
+        seq_len=1024 + FP16: ~79 GB peak (safe)
+        seq_len=1536 + FP16: ~90 GB (tight in 96 GB)
+        seq_len=2048 + FP16: OOM
+      With layer-batched collection (4 batches of ~60 outputs):
+        seq_len=4096 + FP16: ~63 GB peak (safe)
 
-    CRITICAL: The system prompt with 20 tools + full instructions is ~1,865 tokens.
-      At MAX_SEQ_LEN=1024, truncation cuts mid-system-prompt — all tool-call
-      exchanges are lost. We use a COMPACT system prompt (~389 tokens) so that
-      ~891 tokens remain for actual tool-call exchanges (1-2 complete rounds).
+      max_seq_len is set by the caller based on whether batching is active:
+        Default (no batching): MAX_SEQ_LEN_DEFAULT = 1536
+        Batched (--layer-batches): MAX_SEQ_LEN_BATCHED = 4096
 
     Why this works:
       scale_estimation identifies important weight channels by ACTIVATION MAGNITUDES.
@@ -1017,12 +1063,11 @@ When you need to use a tool, respond with:
 Execute tool calls directly. Do not narrate routine operations."""
 
     # ── Memory budget for NNCF statistics collection ────────────────────────
-    # Observed: 79 GB peak at seq_len=1024 (57 GB model + 22 GB NNCF overhead).
-    # Overhead scales ~linearly. At 2048: OOM (tried and failed - 768MB alloc failure).
-    # At 1536: est ~90 GB (1.5× overhead) — tight but within 96 GB RAM.
-    # System: 96 GB RAM + 225 GB page file.
+    # Without batching: 79 GB peak at 1024 tokens. OOM at 2048.
+    # With layer-batched collection: ~63 GB peak. Supports up to 4096.
+    # max_seq_len is passed in from caller based on --layer-batches flag.
     # ────────────────────────────────────────────────────────────────────────
-    MAX_SEQ_LEN = 1536
+    MAX_SEQ_LEN = max_seq_len or MAX_SEQ_LEN_DEFAULT
 
     # Measure system prompt token count for diagnostics
     sys_test = tokenizer.apply_chat_template(
@@ -1038,12 +1083,17 @@ Execute tool calls directly. Do not narrate routine operations."""
     # Vary exchange counts (1-2 per sample to fit within 1280 token budget)
     # Compact system prompt ≈ 389 tokens → 891 tokens for exchanges
     # Each exchange ≈ 300-500 tokens (user + tool_call + result + code + analysis)
-    # 1-2 exchanges → 300-1000 tokens → most fit within budget
-    # Use only compact CODE_SNIPPETS (not LONG_CODE_SNIPPETS) to save space
-    EXCHANGE_RANGE = (1, 2)
-
-    # Use only compact snippets to keep exchanges short enough for 1280 budget
-    all_snippets = CODE_SNIPPETS
+    # With default MAX_SEQ_LEN=1536: 1-2 exchanges (tight budget)
+    # With batched MAX_SEQ_LEN=4096: 3-6 exchanges (richer calibration data)
+    if MAX_SEQ_LEN >= 4096:
+        EXCHANGE_RANGE = (3, 6)
+        all_snippets = CODE_SNIPPETS + LONG_CODE_SNIPPETS
+    elif MAX_SEQ_LEN >= 2048:
+        EXCHANGE_RANGE = (2, 4)
+        all_snippets = CODE_SNIPPETS
+    else:
+        EXCHANGE_RANGE = (1, 2)
+        all_snippets = CODE_SNIPPETS
 
     for i in range(num_samples):
         random.seed(42 + i)  # Reproducible but varied
@@ -1353,6 +1403,15 @@ def main():
                         help="Filter pattern for --inspect mode")
     parser.add_argument("--force", action="store_true",
                         help="Overwrite existing output directory")
+
+    # ── NVMe-offloaded batched statistics ──
+    parser.add_argument("--layer-batches", type=int, default=0,
+                        help="Number of layer batches for statistics collection (0=disabled, 4=recommended). "
+                             "Splits ~242 NNCF stat targets into N batches to reduce peak memory from ~79 GB "
+                             "to ~63 GB, allowing seq_len up to 4096 tokens.")
+    parser.add_argument("--nvme-offload", type=str, default=None,
+                        help="Directory on NVMe for intermediate statistics (e.g. D:\\nvme-temp). "
+                             "Uses Direct I/O to bypass page cache. If not set, uses output_dir/stats_cache.")
 
     args = parser.parse_args()
 
