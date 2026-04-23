@@ -124,9 +124,16 @@ def collect_statistics_batched(
     master_algo = WeightCompression(**config, subset_size=subset_size)
     master_algo.set_backend_entity(model_for_graph)
 
-    # Register all stat points on a throwaway aggregator to discover targets
+    # Register stat points on a throwaway aggregator to discover targets.
+    # Disable mixed precision stats (enable_mixed_precision=False) because:
+    #   1. MoE expert activations are 3D: [128, seq_len, hidden_dim]
+    #   2. Mixed precision hessian stats do x*x on those → 1+ GB per tensor → numpy OOM
+    #   3. With ratio=1.0 (all-INT4), mixed precision sensitivity isn't needed
     discovery_agg = StatisticsAggregatorFactory.create(model_for_graph, nncf_dataset)
-    register_all_statistics(discovery_agg, model_for_graph, graph, subset_size, master_algo)
+    register_all_statistics(
+        discovery_agg, model_for_graph, graph, subset_size, master_algo,
+        enable_mixed_precision=False,
+    )
 
     # Extract target node names (keys of the StatisticPointsContainer)
     all_target_keys = list(discovery_agg.statistic_points.keys())
@@ -170,8 +177,11 @@ def collect_statistics_batched(
 
         batch_agg = StatisticsAggregatorFactory.create(model_for_graph, nncf_dataset)
 
-        # Register ALL stat points (same full set)...
-        register_all_statistics(batch_agg, model_for_graph, graph, subset_size, batch_algo)
+        # Register stat points (no mixed precision — avoids numpy OOM on MoE 3D tensors)
+        register_all_statistics(
+            batch_agg, model_for_graph, graph, subset_size, batch_algo,
+            enable_mixed_precision=False,
+        )
 
         # ...then REMOVE targets not in this batch.
         # This ensures only this batch's Result nodes get inserted during inference,
