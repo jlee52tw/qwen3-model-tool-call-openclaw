@@ -251,13 +251,15 @@ def run_tier1(args):
     # The FP16 model alone is ~57 GB. Without batching, NNCF adds ~242 extra
     # Result nodes: peak = 57 + (242/242)*22*(seq_len/1024) ≈ 79 GB @ 1K tokens.
     # That leaves only ~17 GB free on 96 GB RAM → heavy page-file thrashing.
-    # With batching (4 batches of ~60 outputs): peak ≈ 57 + 5.5 = 63 GB → 33 GB free.
+    # With batching (e.g. 5 batches of ~48 outputs): peak ≈ 57 + 4.4 = 61 GB → 35 GB free.
     # Always batch to avoid paging, regardless of sequence length.
+    # Additional overhead: OV compilation, NNCF graph objects, Python heap → ~10-15 GB
+    # Total safe target: 57 (model) + overhead_outputs + 15 (misc) < 80 GB
     if not use_batched:
         overhead_per_output_per_1k = 22.0 / 242.0  # ~0.091 GB per output per 1K tokens
         scale = max_seq_len / 1024.0
-        # Target: keep output overhead under 8 GB (peak ~65 GB, leaving ~31 GB free)
-        max_safe_outputs = int(8.0 / (overhead_per_output_per_1k * scale))
+        # Target: keep output overhead under 5 GB (peak ~72 GB with misc, leaving ~24 GB free)
+        max_safe_outputs = int(5.0 / (overhead_per_output_per_1k * scale))
         max_safe_outputs = max(8, min(max_safe_outputs, 242))
         needed_batches = max(1, (242 + max_safe_outputs - 1) // max_safe_outputs)
         if needed_batches > 1:
@@ -266,7 +268,7 @@ def run_tier1(args):
             args.layer_batches = needed_batches
             use_batched = True
         else:
-            print(f"[INFO] seq_len={max_seq_len}: all 242 outputs fit in 8 GB overhead budget")
+            print(f"[INFO] seq_len={max_seq_len}: all 242 outputs fit in budget")
 
     # Prepare calibration data — use wikitext2 or custom tool-calling prompts
     calibration_data = _prepare_calibration_dataset(

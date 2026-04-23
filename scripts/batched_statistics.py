@@ -216,6 +216,19 @@ def collect_statistics_batched(
         del batch_agg, batch_algo
         gc.collect()
 
+        # Give OS time to reclaim page cache between batches
+        if i < len(key_batches) - 1:
+            import ctypes
+            try:
+                # On Windows, trim process working set to free physical pages
+                ctypes.windll.kernel32.SetProcessWorkingSetSize(
+                    ctypes.windll.kernel32.GetCurrentProcess(), -1, -1
+                )
+                print(f"           Trimmed process working set")
+            except Exception:
+                pass
+            time.sleep(5)  # Brief pause for OS page reclamation
+
     total_elapsed = time.time() - total_start
     print(f"\n  [Step 3] All batches collected in {total_elapsed:.0f}s ({total_elapsed / 60:.1f} min)")
 
@@ -241,36 +254,35 @@ def collect_statistics_batched(
 
 def _partition_keys_by_layer(keys: list, num_batches: int) -> list:
     """
-    Partition target node keys into N batches by layer number.
+    Partition target node keys into N batches using ROUND-ROBIN distribution.
 
-    Keys look like:
-      ``__module.model.layers.5.self_attn.q_proj/ov_ext::linear/MatMul``
-    We extract the layer number and group sequentially, then split.
-    Non-layer keys (embeddings, lm_head) go in the first batch.
+    Previous approach: group by layer number then split sequentially.
+    Problem: MoE expert MatMul nodes have anonymous names (MatMul_NNNN) without
+    "layers.N" in them, causing all ~144 expert nodes to clump into early batches.
+    Expert nodes are the LARGEST memory consumers (3D weights: [128, 768, 2048]).
+
+    Round-robin ensures every batch has a similar mix of attention + expert nodes,
+    preventing any single batch from being disproportionately memory-heavy.
     """
     layer_pattern = re.compile(r"layers[._](\d+)")
 
-    # Map each key to its layer number (-1 for non-layer nodes)
-    key_layers = {}
-    for key in keys:
+    # Sort keys for deterministic ordering:
+    # 1. By layer number (extracted from name), -1 for anonymous nodes
+    # 2. Then by name within same layer
+    def sort_key(key):
         match = layer_pattern.search(key)
-        key_layers[key] = int(match.group(1)) if match else -1
+        layer = int(match.group(1)) if match else -1
+        return (layer, key)
 
-    # Sort by layer number for sequential batching
-    sorted_keys = sorted(keys, key=lambda k: key_layers[k])
+    sorted_keys = sorted(keys, key=sort_key)
 
-    # Split into approximately equal batches
-    batch_size = max(1, len(sorted_keys) // num_batches)
-    batches = []
+    # Round-robin distribution: key[0]→batch 0, key[1]→batch 1, etc.
+    batches = [[] for _ in range(num_batches)]
+    for i, key in enumerate(sorted_keys):
+        batches[i % num_batches].append(key)
 
-    for i in range(num_batches):
-        start = i * batch_size
-        end = len(sorted_keys) if i == num_batches - 1 else start + batch_size
-        batch = sorted_keys[start:end]
-        if batch:
-            batches.append(batch)
-
-    return batches
+    # Remove empty batches
+    return [b for b in batches if b]
 
 
 def _get_layer_range(keys: list) -> str:
