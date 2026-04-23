@@ -247,28 +247,29 @@ def run_tier1(args):
     else:
         max_seq_len = MAX_SEQ_LEN_DEFAULT
 
-    # Auto-compute layer batches to keep peak memory under 65 GB.
+    # Auto-compute layer batches for memory safety.
     # The FP16 model alone is ~57 GB. Without batching, NNCF adds ~242 extra
     # Result nodes: peak = 57 + (242/242)*22*(seq_len/1024) ≈ 79 GB @ 1K tokens.
-    # That leaves only ~17 GB free on 96 GB RAM → heavy page-file thrashing.
-    # With batching (e.g. 5 batches of ~48 outputs): peak ≈ 57 + 4.4 = 61 GB → 35 GB free.
-    # Always batch to avoid paging, regardless of sequence length.
-    # Additional overhead: OV compilation, NNCF graph objects, Python heap → ~10-15 GB
-    # Total safe target: 57 (model) + overhead_outputs + 15 (misc) < 80 GB
-    if not use_batched:
+    # At 1K tokens with 96 GB RAM: tight (0.5 GB free) but completes (~1.7h).
+    # Above ~1536 tokens: OOM without batching.
+    #
+    # IMPORTANT: OV CPU plugin doesn't properly release compiled model buffers
+    # between batches in the same process. Batch 2+ always fails with
+    # "Failed to allocate N bytes" even with 58 GB free RAM.
+    # Therefore: only batch when REQUIRED (seq_len > 1536), not by default.
+    # For seq_len <= 1536: accept the heavy paging (~1.7h for 8 samples @ 1K).
+    if not use_batched and max_seq_len > MAX_SEQ_LEN_DEFAULT:
         overhead_per_output_per_1k = 22.0 / 242.0  # ~0.091 GB per output per 1K tokens
         scale = max_seq_len / 1024.0
-        # Target: keep output overhead under 5 GB (peak ~72 GB with misc, leaving ~24 GB free)
+        # Target: keep output overhead under 5 GB
         max_safe_outputs = int(5.0 / (overhead_per_output_per_1k * scale))
         max_safe_outputs = max(8, min(max_safe_outputs, 242))
         needed_batches = max(1, (242 + max_safe_outputs - 1) // max_safe_outputs)
         if needed_batches > 1:
-            print(f"[AUTO] Always-batch mode: {needed_batches} batches "
-                  f"(max {max_safe_outputs} outputs/batch → ~{57 + max_safe_outputs * overhead_per_output_per_1k * scale:.0f} GB peak)")
+            print(f"[AUTO] max_seq_len={max_seq_len} requires batching: {needed_batches} batches "
+                  f"(max {max_safe_outputs} outputs/batch)")
             args.layer_batches = needed_batches
             use_batched = True
-        else:
-            print(f"[INFO] seq_len={max_seq_len}: all 242 outputs fit in budget")
 
     # Prepare calibration data — use wikitext2 or custom tool-calling prompts
     calibration_data = _prepare_calibration_dataset(
@@ -326,6 +327,7 @@ def run_tier1(args):
     _orig_se_apply = _se_mod.ScaleEstimation.apply
 
     def _patched_se_apply(self, model, graph, all_weight_params, statistics, backend_entity=None):
+        """Patched ScaleEstimation.apply that catches IndexError on 3D MoE expert weights."""
         from nncf.common.logging.track_progress import track
         self._backend_entity = backend_entity
         if self._backend_entity is None:
@@ -348,11 +350,6 @@ def run_tier1(args):
                 continue
             _, weight_port_id = weight_data[0]
 
-            if self._backend_entity.matmul_has_transposed_activations(wp.node_with_weight, graph):
-                import nncf as _nncf_err
-                raise _nncf_err.UnsupportedModelError(
-                    "Transposed activations not supported for Scale Estimation")
-
             weight = self._backend_entity.get_weight(wp.node_with_weight, weight_port_id, model, graph)
 
             try:
@@ -361,14 +358,17 @@ def run_tier1(args):
                     self._subset_size, self._initial_steps, self._scale_steps, self._weight_penalty,
                 )
                 res[weight_name] = CompressedWeight(None, scale, zero_point, None)
-            except IndexError:
-                # 3D MoE expert weight: stats dimension mismatch, skip scale estimation
-                res[weight_name] = CompressedWeight()
-                skipped_3d += 1
+            except (IndexError, Exception) as e:
+                if isinstance(e, IndexError) or "shape" in str(e).lower() or "dimension" in str(e).lower():
+                    # 3D MoE expert weight: stats dimension mismatch, skip scale estimation
+                    res[weight_name] = CompressedWeight()
+                    skipped_3d += 1
+                else:
+                    raise
 
         if skipped_3d:
             print(f"  [PATCH] Skipped scale estimation for {skipped_3d} 3D MoE expert weights "
-                  f"(IndexError: stats dimension mismatch). Using default quantization for those layers.")
+                  f"(stats dimension mismatch). Using default quantization for those layers.")
         return res
 
     _se_mod.ScaleEstimation.apply = _patched_se_apply
